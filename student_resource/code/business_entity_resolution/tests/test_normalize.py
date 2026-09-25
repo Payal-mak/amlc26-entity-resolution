@@ -195,3 +195,27 @@ class TestHouseNumberParts(unittest.TestCase):
 
     def test_postal_code_dropped_once(self):
         self.assertEqual(self.parts("7800 Valburn Drive, Austin 78701", "78701"), (("7800", ""),))
+
+
+class TestStreetAbbreviationsGeneral(unittest.TestCase):
+    key = staticmethod(normalize.street_key)
+
+    def test_general_street_words(self):
+        self.assertEqual(self.key("12 Av Victor Hugo, Paris"), "avenue victor hugo paris")
+        self.assertEqual(self.key("3 Bd Voltaire"), "boulevard voltaire")
+        self.assertEqual(self.key("5 Imp des Roses"), "impasse des roses")
+        self.assertEqual(self.key("7 Rte de Lyon"), "route de lyon")
+        self.assertEqual(self.key("8 Pl de la Gare"), "place de la gare")
+        self.assertEqual(self.key("100 Ave Foch"), "avenue foch")
+
+    def test_guarded_abbreviations_expand_after_a_house_number(self):
+        self.assertEqual(self.key("12 R Victor Hugo"), "rue victor hugo")
+        self.assertEqual(self.key("5 Ch des Vignes"), "chemin des vignes")
+        self.assertEqual(self.key("3 All des Roses"), "allee des roses")
+
+    def test_guarded_abbreviations_left_alone_elsewhere(self):
+        self.assertEqual(self.key("R K Puram, New Delhi"), "r k puram new delhi")      # initial, no number before
+        self.assertEqual(self.key("All Saints Road"), "all saints road")               # ordinary word
+        self.assertEqual(self.key("12 R K Puram"), "r k puram")                         # next token too short
+        self.assertEqual(self.key("Plot 4 R"), "plot r")                                # nothing after it
+        self.assertEqual(self.key("21 All Saints Rd"), "allee saints road")            # documents the known limit

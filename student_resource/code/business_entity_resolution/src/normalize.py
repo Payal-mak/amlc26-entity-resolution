@@ -115,12 +115,37 @@ ADDRESS_ABBREVIATIONS = {
     **{k: v for k, v in ABBREVIATIONS.items() if k in {"rd", "st", "ave", "blvd", "dr", "ln", "ct", "pl", "apt", "ste", "hwy", "pkwy"}},
     "cir": "circle", "sq": "square", "ter": "terrace", "trl": "trail", "expy": "expressway",
     "rte": "route", "bldg": "building", "nr": "near", "opp": "opposite",
+    # Street words used in many languages (French forms included on purpose:
+    # a generic map, not gated on country).
+    "av": "avenue", "bd": "boulevard", "imp": "impasse",
 }
+# Ambiguous with initials or ordinary words ("R K Puram", "All Saints Road",
+# "Ch"): expanded ONLY in the position a street type takes -- right after a
+# house number and before a word of 3+ letters ("12 r victor hugo" ->
+# "12 rue victor hugo"; "r k puram", "all saints road" stay as they are).
+GUARDED_ADDRESS_ABBREVIATIONS = {"r": "rue", "ch": "chemin", "all": "allee"}
 
 
 def expand_address_abbreviations(text: str) -> str:
-    """Whole-token expansion of ADDRESS_ABBREVIATIONS on a basic_clean'd address."""
-    return " ".join(ADDRESS_ABBREVIATIONS.get(tok, tok) for tok in text.split(" ") if tok)
+    """Whole-token expansion of ADDRESS_ABBREVIATIONS on a basic_clean'd address,
+    plus GUARDED_ADDRESS_ABBREVIATIONS where a number precedes and a 3+ letter
+    word follows the token."""
+    tokens = [t for t in text.split(" ") if t]
+    out = []
+    for i, tok in enumerate(tokens):
+        if tok in ADDRESS_ABBREVIATIONS:
+            out.append(ADDRESS_ABBREVIATIONS[tok])
+        elif (
+            tok in GUARDED_ADDRESS_ABBREVIATIONS
+            and 0 < i < len(tokens) - 1
+            and tokens[i - 1].isdigit()
+            and len(tokens[i + 1]) >= 3
+            and tokens[i + 1].isalpha()
+        ):
+            out.append(GUARDED_ADDRESS_ABBREVIATIONS[tok])
+        else:
+            out.append(tok)
+    return " ".join(out)
 
 
 def street_key(address: str) -> str:
@@ -131,10 +156,12 @@ def street_key(address: str) -> str:
     house/unit/plot numbers, PIN/ZIP codes, "c-440" style codes), e.g.
     "7800 Valburn Dr, Austin, TX" -> "valburn drive austin tx". Used to compare
     the street/locality part of two addresses when their house numbers are
-    truncated, mistyped or missing.
+    truncated, mistyped or missing. Abbreviations are expanded BEFORE the
+    numbers are dropped, because the guarded ones ("12 r victor hugo") need to
+    see the house number next to them.
     """
-    tokens = [t for t in basic_clean(address).split(" ") if t and not any(c.isdigit() for c in t)]
-    return expand_address_abbreviations(" ".join(tokens))
+    expanded = expand_address_abbreviations(basic_clean(address))
+    return " ".join(t for t in expanded.split(" ") if t and not any(c.isdigit() for c in t))
 
 
 def house_numbers(address: str, postal_code: str = None) -> tuple:
