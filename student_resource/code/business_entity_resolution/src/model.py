@@ -13,11 +13,20 @@ its histogram-binned training keeps memory low even at several-million-row
 scale, which matters on this 8GB dev machine (see PROJECT_LOG.md's hardware
 audit) -- most of today's crashes were in blocking's raw SQL joins, not
 anything model-related.
+
+Import order matters on the dev machine: `lightgbm` must be imported before
+`pandas` anywhere in the process, or LightGBM's native Dataset construction
+segfaults (access violation in set_label) on any data at all. Importing it
+first here only protects a caller that imports src.model before anything
+else touches pandas; every real entry point (scripts/phase4_train_and_decide,
+scripts/run_pipeline) also imports lightgbm as its own first line for that
+reason -- see their docstrings and PROJECT_LOG.md.
 """
+
+from lightgbm import LGBMClassifier
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
 from sklearn.model_selection import GroupKFold
 
 DEFAULT_PARAMS = dict(
@@ -57,8 +66,13 @@ def train_oof(
     p["random_state"] = seed
 
     groups = df[group_col].values
-    X = df[feature_cols].values
-    y = df[label_col].values
+    # ascontiguousarray is required, not cosmetic: df[cols].values on a frame
+    # concatenated from parquet files with mixed dtypes (float32 features,
+    # int64 rank columns) can hand back a non-C-contiguous array, and
+    # LightGBM's native library segfaults (access violation) reading the
+    # label field when fed one -- reproduced directly on this machine.
+    X = np.ascontiguousarray(df[feature_cols].values, dtype=np.float64)
+    y = np.ascontiguousarray(df[label_col].values, dtype=np.float64)
 
     gkf = GroupKFold(n_splits=n_folds)
     oof_proba = np.zeros(len(df), dtype=np.float64)
@@ -83,6 +97,7 @@ def predict_with_fold_models(models: list, X: np.ndarray) -> np.ndarray:
     Inputs: list of fitted models (from train_oof), feature matrix.
     Output: mean predicted probability of the positive class across models.
     """
+    X = np.ascontiguousarray(X, dtype=np.float64)
     preds = np.column_stack([m.predict_proba(X)[:, 1] for m in models])
     return preds.mean(axis=1)
 

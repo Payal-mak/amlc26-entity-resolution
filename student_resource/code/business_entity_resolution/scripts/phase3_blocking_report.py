@@ -19,17 +19,16 @@ import sys
 import time
 from pathlib import Path
 
-import duckdb
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import blocking, config, io_utils, normalize  # noqa: E402
+from src import blocking, config, io_utils  # noqa: E402
 
 VAL_SLICE_DIR = config.PARQUET_DIR / "val_slice"
 PHASE2_DIR = config.PARQUET_DIR / "phase2"
 PHASE3_DIR = config.PARQUET_DIR / "phase3"
-BLOCK_NAMES = ["b1_exact_core", "b2_rare_token", "b3_postal_minor", "b_sorted_neighborhood", "bgeo_address_token"]
+BLOCK_NAMES = blocking.BLOCK_NAMES
 
 
 def load_suffix_sets() -> dict:
@@ -66,42 +65,6 @@ def load_and_normalize() -> tuple:
     return s1, cand
 
 
-def register_suffix_table(con: duckdb.DuckDBPyConnection, suffix_sets: dict) -> None:
-    rows = [(country, token) for country, toks in suffix_sets.items() for token in toks]
-    df = pd.DataFrame(rows, columns=["country", "token"])
-    con.register("suffix_tmp", df)
-    con.execute("CREATE OR REPLACE TABLE suffix_table AS SELECT * FROM suffix_tmp")
-    con.unregister("suffix_tmp")
-
-
-def run_blocks_for_country(con: duckdb.DuckDBPyConnection, s1_country: pd.DataFrame, cand_country: pd.DataFrame) -> dict:
-    """Register base views and run every block for ONE country's data.
-
-    Inputs: connection, s1/cand dataframes already filtered to one country.
-    Output: {block_name: table_name}.
-    """
-    con.register("s1_raw", s1_country)
-    con.register("cand_raw", cand_country)
-    con.execute("CREATE OR REPLACE TABLE s1_norm AS SELECT * FROM s1_raw")
-    con.execute("CREATE OR REPLACE TABLE cand_norm AS SELECT * FROM cand_raw")
-    con.unregister("s1_raw")
-    con.unregister("cand_raw")
-
-    blocking.register_postal_code(con, "s1_norm", "s1_pc")
-    blocking.register_postal_code(con, "cand_norm", "cand_pc")
-    blocking.register_geo_tokens(con, "s1_norm", "s1_geo")
-    blocking.register_geo_tokens(con, "cand_norm", "cand_geo")
-    blocking.register_name_tokens(con, "s1_norm", "s1_tok")
-    blocking.register_name_tokens(con, "cand_norm", "cand_tok")
-
-    b1 = blocking.block_b1_exact_core(con, "s1_pc", "cand_pc")
-    b2 = blocking.block_b2_rare_token(con, "s1_tok", "cand_tok", "suffix_table")
-    b3 = blocking.block_b3_postal(con, "s1_pc", "cand_pc", "s1_tok", "cand_tok")
-    bneighbor = blocking.block_b_sorted_neighborhood(con, "s1_pc", "cand_pc")
-    bgeo = blocking.block_b_geo(con, "s1_geo", "cand_geo")
-    return dict(zip(BLOCK_NAMES, [b1, b2, b3, bneighbor, bgeo]))
-
-
 def load_eval_truth() -> dict:
     """{s1_id: set(matched_ids)} restricted to is_eval==True S1 entities."""
     s1 = pd.read_parquet(VAL_SLICE_DIR / "source1.parquet", columns=["entity_id", "is_eval"])
@@ -136,11 +99,11 @@ def run() -> dict:
     for country in countries:
         tc = time.time()
         con = io_utils.get_connection()
-        register_suffix_table(con, suffix_sets)
+        blocking.register_suffix_table(con, suffix_sets)
 
         s1_c = s1[s1["country"] == country]
         cand_c = cand[cand["country"] == country]
-        block_views = run_blocks_for_country(con, s1_c, cand_c)
+        block_views = blocking.run_all_blocks(con, s1_c, cand_c)
 
         for name, view in block_views.items():
             n = con.execute(f"SELECT COUNT(*) FROM {view}").fetchone()[0]

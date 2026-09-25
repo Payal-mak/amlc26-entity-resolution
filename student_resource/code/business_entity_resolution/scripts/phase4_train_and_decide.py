@@ -7,6 +7,15 @@ Usage (from code/business_entity_resolution/):
     python -m scripts.phase4_train_and_decide
 """
 
+# MUST be the first import in this process, before pandas/duckdb/pyarrow --
+# on this dev machine, importing lightgbm AFTER pandas has already loaded
+# its native extensions causes a reproducible access violation deep inside
+# LightGBM's C API (crashes on literally any data, in set_label, regardless
+# of row count/dtype/contiguity -- isolated by bisecting import order, see
+# PROJECT_LOG.md). Importing lightgbm first sidesteps whatever DLL/runtime
+# it conflicts with.
+import lightgbm  # noqa: F401,E402
+
 import json
 import sys
 import time

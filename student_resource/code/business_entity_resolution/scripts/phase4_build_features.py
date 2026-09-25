@@ -3,16 +3,28 @@ country, writing straight to parquet on D: (never holding both countries'
 feature matrices in memory at once -- the same discipline as Phase 3, after
 three OOM crashes there).
 
-Uses whatever capped_{country}.parquet / tagged_{country}.parquet Phase 3
-last wrote (currently the B2_MAX_CAND_TOKEN_DF=400 run -- see PROJECT_LOG.md:
-the 150-vs-400 difference was measured negligible, and regenerating clean
-150 artifacts wasn't worth another 9-minute run given the time-box).
+Rewritten after a 4th crash (see PROJECT_LOG.md): the previous version read
+an entire country's capped_{country}.parquet (6.7M rows for India) into one
+pandas DataFrame and ran fillna/str.contains over all of it at once, which
+failed outright once free system RAM dropped below ~500MB (Chrome/VS Code
+memory pressure, not this job's own growth -- it died 32s in).
+
+Uses whatever capped_{country}.parquet Phase 3 last wrote (currently the
+B2_MAX_CAND_TOKEN_DF=400 run -- see PROJECT_LOG.md: the 150-vs-400 difference
+was measured negligible, and regenerating clean 150 artifacts wasn't worth
+another 9-minute run given the time-box).
+
+The actual streaming/memory-safe machinery (chunked batches, the DuckDB
+context-feature pass) lives in src/features.py as build_country_features,
+shared with scripts/run_pipeline.py's real train/test build -- this script
+only handles the validation-slice-specific plumbing (loading the slice,
+building the label map from ground_truth_in_slice.parquet).
 
 Usage (from code/business_entity_resolution/):
     python -m scripts.phase4_build_features
 """
 
-import re
+import gc
 import sys
 import time
 from pathlib import Path
@@ -28,18 +40,6 @@ PHASE2_DIR = config.PARQUET_DIR / "phase2"
 PHASE3_DIR = config.PARQUET_DIR / "phase3"
 PHASE4_DIR = config.PARQUET_DIR / "phase4"
 
-_POSTAL_RE_6 = re.compile(r"(\d{6})\D*$")
-_POSTAL_RE_5 = re.compile(r"(\d{5})(?:-\d{4})?\D*$")
-
-
-def _extract_postal(addr) -> str:
-    addr = addr or ""
-    m = _POSTAL_RE_6.search(addr)
-    if m:
-        return m.group(1)
-    m = _POSTAL_RE_5.search(addr)
-    return m.group(1) if m else None
-
 
 def load_normalized_slice() -> tuple:
     suffix_df = pd.read_parquet(PHASE2_DIR / "suffix_token_candidates.parquet")
@@ -53,8 +53,6 @@ def load_normalized_slice() -> tuple:
     s1 = blocking.add_normalized_columns(s1, suffix_sets, translit_map)
     s2 = blocking.add_normalized_columns(s2, suffix_sets, translit_map)
     s3 = blocking.add_normalized_columns(s3, suffix_sets, translit_map)
-    for df in (s1, s2, s3):
-        df["postal_code"] = df["business_address"].map(_extract_postal)
     cand = pd.concat([s2, s3], ignore_index=True)
     return s1, cand
 
@@ -71,31 +69,28 @@ def run() -> None:
     t0 = time.time()
     PHASE4_DIR.mkdir(parents=True, exist_ok=True)
     s1, cand = load_normalized_slice()
-    print(f"loaded+normalized: s1={len(s1)} cand={len(cand)} ({time.time()-t0:.1f}s)")
+    print(f"loaded+normalized: s1={len(s1)} cand={len(cand)} ({time.time()-t0:.1f}s)", flush=True)
 
     label_map = build_labels()
 
     for country in sorted(s1["country"].unique()):
         tc = time.time()
-        pairs = pd.read_parquet(PHASE3_DIR / f"capped_{country}.parquet")
         s1_c = s1[s1["country"] == country]
         cand_c = cand[cand["country"] == country]
-
-        feat = features.build_pair_features(pairs, s1_c, cand_c)
-        feat["label"] = [
-            1 if cid in label_map.get(sid, ()) else 0 for sid, cid in zip(feat["s1_id"], feat["cand_id"])
-        ]
-        feat["country"] = country
-
+        pairs_path = PHASE3_DIR / f"capped_{country}.parquet"
         out_path = PHASE4_DIR / f"features_{country}.parquet"
-        feat.to_parquet(out_path, index=False)
-        print(
-            f"  country={country}: pairs={len(feat)} positives={feat['label'].sum()} "
-            f"({time.time()-tc:.1f}s) -> {out_path.name}"
-        )
-        del pairs, feat
 
-    print(f"done ({time.time()-t0:.1f}s)")
+        n_rows, n_pos = features.build_country_features(pairs_path, s1_c, cand_c, out_path, label_map, country)
+        print(
+            f"  country={country}: features done, pairs={n_rows} positives={n_pos} "
+            f"({time.time()-tc:.1f}s) -> {out_path.name}",
+            flush=True,
+        )
+
+        del s1_c, cand_c
+        gc.collect()
+
+    print(f"done ({time.time()-t0:.1f}s)", flush=True)
 
 
 if __name__ == "__main__":

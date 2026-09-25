@@ -3,6 +3,7 @@ student_resource/dataset/
 *.tsv
 *.parquet
 *.duckdb
+*.zip
 
 # Generated outputs / submissions (never commit results, only code)
 student_resource/output/

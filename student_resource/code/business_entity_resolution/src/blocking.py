@@ -45,6 +45,8 @@ blocks is a second, smaller safety net (see `cap_candidates`), not the
 primary control.
 """
 
+import re
+
 import duckdb
 import pandas as pd
 
@@ -56,6 +58,26 @@ COALESCE(
     NULLIF(regexp_extract(business_address, '(\\d{5})(?:-\\d{4})?\\D*$', 1), '')
 )
 """
+
+# Python-side equivalent of POSTAL_EXPR above (same two regexes -- 6-digit
+# India PIN, then 5(+4) US ZIP -- kept identical on purpose so a pandas-side
+# postal_code column always agrees with the SQL-side one blocking uses).
+_POSTAL_RE_6 = re.compile(r"(\d{6})\D*$")
+_POSTAL_RE_5 = re.compile(r"(\d{5})(?:-\d{4})?\D*$")
+
+
+def extract_postal(address) -> str:
+    """Extract a postal code from a raw address string, or None.
+
+    Inputs: raw business_address (or None/NaN). Output: the matched digit
+    string, or None if neither pattern matches.
+    """
+    address = address or ""
+    m = _POSTAL_RE_6.search(address)
+    if m:
+        return m.group(1)
+    m = _POSTAL_RE_5.search(address)
+    return m.group(1) if m else None
 
 MIN_TOKEN_LEN = 3
 MIN_GEO_TOKEN_DF = 3
@@ -94,6 +116,7 @@ def add_normalized_columns(df: pd.DataFrame, suffix_sets: dict, translit_map: di
         normalize.name_core(nf, suffix_sets.get(c, set()))
         for nf, c in zip(df["name_full"], df["country"])
     ]
+    df["postal_code"] = df["business_address"].map(extract_postal)
     return df
 
 
@@ -396,3 +419,65 @@ def cap_candidates(con: duckdb.DuckDBPyConnection, scored_view: str, cap: int = 
         """
     )
     return out
+
+
+BLOCK_NAMES = ["b1_exact_core", "b2_rare_token", "b3_postal_minor", "b_sorted_neighborhood", "bgeo_address_token"]
+
+
+def register_suffix_table(con: duckdb.DuckDBPyConnection, suffix_sets: dict) -> None:
+    """Register {country: set(tokens)} as a DuckDB table for B2's anti-join
+    exclusion (see block_b2_rare_token).
+    """
+    rows = [(country, token) for country, toks in suffix_sets.items() for token in toks]
+    df = pd.DataFrame(rows, columns=["country", "token"])
+    con.register("suffix_tmp", df)
+    con.execute("CREATE OR REPLACE TABLE suffix_table AS SELECT * FROM suffix_tmp")
+    con.unregister("suffix_tmp")
+
+
+def run_all_blocks(con: duckdb.DuckDBPyConnection, s1_country: pd.DataFrame, cand_country: pd.DataFrame) -> dict:
+    """Register base views and run every block for ONE country's already-
+    normalized (name_full/name_core/postal_code present) S1/candidate frames.
+
+    Requires register_suffix_table to have already been called on `con`.
+    Inputs: connection, s1/cand dataframes already filtered to one country.
+    Output: {block_name: table_name}, same keys/order as BLOCK_NAMES.
+    """
+    con.register("s1_raw", s1_country)
+    con.register("cand_raw", cand_country)
+    con.execute("CREATE OR REPLACE TABLE s1_norm AS SELECT * FROM s1_raw")
+    con.execute("CREATE OR REPLACE TABLE cand_norm AS SELECT * FROM cand_raw")
+    con.unregister("s1_raw")
+    con.unregister("cand_raw")
+
+    register_postal_code(con, "s1_norm", "s1_pc")
+    register_postal_code(con, "cand_norm", "cand_pc")
+    register_geo_tokens(con, "s1_norm", "s1_geo")
+    register_geo_tokens(con, "cand_norm", "cand_geo")
+    register_name_tokens(con, "s1_norm", "s1_tok")
+    register_name_tokens(con, "cand_norm", "cand_tok")
+
+    b1 = block_b1_exact_core(con, "s1_pc", "cand_pc")
+    b2 = block_b2_rare_token(con, "s1_tok", "cand_tok", "suffix_table")
+    b3 = block_b3_postal(con, "s1_pc", "cand_pc", "s1_tok", "cand_tok")
+    bneighbor = block_b_sorted_neighborhood(con, "s1_pc", "cand_pc")
+    bgeo = block_b_geo(con, "s1_geo", "cand_geo")
+    return dict(zip(BLOCK_NAMES, [b1, b2, b3, bneighbor, bgeo]))
+
+
+def block_and_cap_country(con: duckdb.DuckDBPyConnection, s1_country: pd.DataFrame, cand_country: pd.DataFrame) -> tuple:
+    """Full per-country blocking pipeline in one call: every block, union +
+    score, then the final cap. Used by scripts/run_pipeline.py's real
+    train/test build; scripts/phase3_blocking_report.py calls the pieces
+    (run_all_blocks / union_and_score / cap_candidates) directly instead
+    since it also needs the raw per-block tagging for recall reporting.
+
+    Requires register_suffix_table to have already been called on `con`.
+    Output: (capped_df, block_views) -- capped_df has columns (s1_id,
+    cand_id, blocks, n_blocks, rank); block_views is {block_name: table_name}.
+    """
+    block_views = run_all_blocks(con, s1_country, cand_country)
+    union_view = union_and_score(con, block_views)
+    capped_view = cap_candidates(con, union_view)
+    capped_df = con.execute(f"SELECT * FROM {capped_view}").fetchdf()
+    return capped_df, block_views

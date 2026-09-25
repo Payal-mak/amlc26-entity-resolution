@@ -1,9 +1,13 @@
 """Central paths, constants, and knobs shared by every pipeline stage.
 
 Kept dependency-free (stdlib only) so every other module can import it cheaply.
-All large/generated artifacts are pinned to WORK_DIR on the D: drive: the C:
-drive on the dev machine has only ~5GB free, nowhere near enough for the raw
-data plus intermediate parquet/DuckDB files, while D: has ~490GB free.
+Every path below is overridable via an AML_* environment variable (which
+scripts/run_pipeline.py's CLI flags set) so the exact same code runs
+unmodified on the local dev machine (Windows, D: drive) and on Kaggle
+(Windows or Linux, /kaggle/input + /kaggle/working) -- nothing here assumes a
+specific OS or drive letter; the only OS-specific default (D:) is used only
+when that drive actually exists, and falls back to a repo-relative path
+otherwise.
 """
 
 import os
@@ -12,10 +16,15 @@ from pathlib import Path
 # student_resource/code/business_entity_resolution/src/config.py -> student_resource/
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-DATA_DIR = REPO_ROOT / "dataset"
+# Dataset root (contains train/ and test/). On Kaggle this is normally
+# /kaggle/input/<dataset-name>/dataset -- set AML_DATA_DIR to that path.
+DATA_DIR = Path(os.environ.get("AML_DATA_DIR", str(REPO_ROOT / "dataset")))
 TRAIN_DIR = DATA_DIR / "train"
 TEST_DIR = DATA_DIR / "test"
-OUTPUT_DIR = REPO_ROOT / "output"
+
+# Final submission files. On Kaggle set AML_OUTPUT_DIR to somewhere under
+# /kaggle/working (the only persisted-output location there).
+OUTPUT_DIR = Path(os.environ.get("AML_OUTPUT_DIR", str(REPO_ROOT / "output")))
 
 TRAIN_SOURCE1 = TRAIN_DIR / "train_source1.tsv"
 TRAIN_SOURCE2 = TRAIN_DIR / "train_source2.tsv"
@@ -26,13 +35,27 @@ TEST_SOURCE1 = TEST_DIR / "test_source1.tsv"
 TEST_SOURCE2 = TEST_DIR / "test_source2.tsv"
 TEST_SOURCE3 = TEST_DIR / "test_source3.tsv"
 
-# Large-artifact working directory. Overridable via AML_WORK_DIR so teammates
-# on a different machine/drive layout are not hardcoded to D:.
-WORK_DIR = Path(os.environ.get("AML_WORK_DIR", "D:/amazon_ml_work"))
+
+def _default_work_dir() -> str:
+    """D:/amazon_ml_work on this dev machine (D: has ~490GB free vs C:'s
+    ~5GB); a repo-relative .work/ directory anywhere else (Kaggle, another
+    teammate's machine, CI) where D: doesn't exist. AML_WORK_DIR always wins
+    over both.
+    """
+    d_drive = Path("D:/")
+    if d_drive.exists():
+        return "D:/amazon_ml_work"
+    return str(REPO_ROOT / ".work")
+
+
+# Large-artifact working directory (parquet/duckdb/tmp intermediates -- never
+# committed, see .gitignore). On Kaggle set AML_WORK_DIR to /kaggle/temp/... :
+# temp is fast local scratch and doesn't count against output size limits.
+WORK_DIR = Path(os.environ.get("AML_WORK_DIR", _default_work_dir()))
 DUCKDB_DIR = WORK_DIR / "duckdb"
 DUCKDB_TMP_DIR = WORK_DIR / "tmp"
 PARQUET_DIR = WORK_DIR / "parquet"
-SUBMISSIONS_DIR = WORK_DIR / "submissions"
+SUBMISSIONS_DIR = REPO_ROOT / "submissions"
 DUCKDB_PATH = DUCKDB_DIR / "aml.duckdb"
 
 # DuckDB memory ceiling. Machine has 8GB total / ~1.6GB free at times, so keep

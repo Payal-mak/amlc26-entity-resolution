@@ -626,3 +626,112 @@ Kaggle setup itself becomes a bigger time sink than expected.
 ### Next
 Moving into Phase 4 (features + LightGBM + decision layer) now, per the time-box
 decision above.
+
+## 2026-09-25 — Git/GitHub setup, a real Phase 4 OOM crash, and Kaggle portability
+
+### Repo pushed to GitHub
+Added `.gitignore` (excludes `dataset/`, `*.tsv`/`*.parquet`/`*.duckdb`, `output/`,
+`submissions/` contents, model artifacts, `__pycache__/`, `.venv/`, OS junk) — verified
+the staged diff had zero data files before the first commit. Remote pointed at a
+different repo than intended; corrected to `github.com/Payal-mak/amlc26-entity-resolution`
+and pushed to `main`. Going forward: commit after each completed phase.
+
+### Phase 4 feature-build actually crashed (not just slow) — real OOM, root-caused and fixed
+The backgrounded `phase4_build_features.py` run from the previous session died silently:
+the harness lost track of it across a session boundary, and the log showed a plain
+`numpy._core._exceptions._ArrayMemoryError` trying to allocate **51 MiB** — trivially
+small — while doing `pairs["blocks"].fillna("")` over India's 6.69M-row capped-pairs
+table. Measured cause: system-available RAM had dropped to ~250-500MB from Chrome/VS
+Code memory pressure (unrelated to this job's own growth, confirmed by checking with
+nothing of mine running) — at that level, even a modest allocation fails.
+
+**Fix (structural, not a bigger machine):** rewrote the country-scale feature build to
+never hold more than one 100k-row batch of pairs in pandas at a time:
+1. `features.build_pair_features_base` split out from the old `build_pair_features` —
+   computes only pairwise (non-context) features, safe to call chunk-by-chunk.
+2. `features.build_base_features_streaming` streams a capped-pairs parquet via
+   `pyarrow.parquet.ParquetFile.iter_batches`, writing each batch straight to a temp
+   "base features" parquet (never materializes the whole country's pairs table).
+3. Context features (`rank_by_s1`, `gap_to_best_by_s1`, `reverse_rank`) **cannot** be
+   computed per-chunk — they need every row for a given `s1_id`/`cand_id` at once, so
+   chunking them would silently corrupt them (the exact bug class already fixed once
+   for the val-slice EVAL/CONTEXT design). Moved to a second pass,
+   `features.add_context_features_via_duckdb`, as DuckDB window functions
+   (`ROW_NUMBER() OVER (PARTITION BY ...)`) over the on-disk base file — DuckDB spills
+   past its memory cap instead of holding it all in RAM, same pattern as Phase 3's
+   blocking.
+4. `features.build_country_features` wraps both steps as the one real entry point.
+
+Smoke-tested the whole path (streaming write + DuckDB context pass) on synthetic data
+before relaunching for real, with `AML_DUCKDB_MEMORY_LIMIT=1GB` given the memory crisis.
+
+**Result — Phase 4 feature build completed cleanly:**
+
+| country | pairs | positives | time |
+|---|---|---|---|
+| India | 6,694,557 | 378,841 | 1413s base + 44s context |
+| US | 4,868,930 | 248,901 | 471s + 20s |
+
+Total 33m13s. Both `features_India.parquet` / `features_US.parquet` now exist; training
+(`phase4_train_and_decide.py`) is next.
+
+### Kaggle portability + `scripts/run_pipeline.py` (requested mid-session, ahead of the actual Phase 5 run)
+User's framing: "next runs may happen on Kaggle" — so before running the real
+train/test pipeline anywhere, made every path configurable and built the single
+end-to-end entry point Phase 5 was always going to need, generalized rather than
+val-slice-specific.
+
+- `src/config.py`: `DATA_DIR`/`OUTPUT_DIR` now read `AML_DATA_DIR`/`AML_OUTPUT_DIR` (previously
+  hardcoded to repo-relative paths); `WORK_DIR`'s `D:/amazon_ml_work` default is now
+  guarded by `Path("D:/").exists()`, falling back to a repo-relative `.work/` dir
+  everywhere else (Kaggle is normally Linux — no `D:` drive at all). `AML_WORK_DIR`/
+  `AML_DUCKDB_MEMORY_LIMIT`/`AML_DUCKDB_THREADS` already existed from Phase 3's crash
+  fixes and needed no change. `SUBMISSIONS_DIR` moved from under `WORK_DIR` to
+  `REPO_ROOT/submissions` (repo-relative, gitignored) so versioned-copy history isn't
+  lost if `WORK_DIR` gets wiped between runs.
+- `src/blocking.py`: promoted `register_suffix_table`/`run_all_blocks` (formerly
+  duplicated inside `scripts/phase3_blocking_report.py`) to first-class module
+  functions, plus a new `block_and_cap_country` one-call wrapper — both the validation
+  report and the new real pipeline now call the same code.
+- `src/write_outputs.py`: implemented for real (was a TODO stub) — TSV writer for both
+  output files (one row per **required** id, passed explicitly by the caller so a
+  pipeline bug that drops an S1 entity becomes a validator error, not a silently short
+  file), a `run_validator` wrapper around `utils/validate_submission.py`, and
+  `save_versioned_copy` into `submissions/<timestamp>/`.
+- `scripts/run_pipeline.py` (new): `normalize -> train_features -> train ->
+  test_features -> predict -> write`, driven by `--data-dir`/`--work-dir`/
+  `--output-dir`/`--duckdb-memory`/`--duckdb-threads`/`--stage` flags that just set
+  `AML_*` env vars before `src.config` is ever imported. `--stage <name>` re-runs one
+  stage only, for resuming after a crash. Per-country blocking+feature loop is shared
+  with the Phase 4 validation build via `features.build_country_features`.
+- End-to-end smoke-tested against hand-built synthetic train/test TSVs (6 train S1s
+  incl. one true singleton, 4 test S1s incl. a France-only row with zero training
+  presence) through every stage, `--stage all`, including the validator (`PASS`) and the
+  versioned-copy archive.
+
+### A second real bug the smoke test caught: LightGBM segfaults if `pandas` is imported first
+Training crashed even on the tiny synthetic data with `OSError: exception: access
+violation reading 0x0000000000000000` inside LightGBM's native `set_label` call — not a
+data problem (confirmed by bisection: contiguous/correctly-typed arrays, no NaN/Inf,
+crashes even on pure-random X with our real y and vice versa). Root cause, isolated by
+changing only import order in an otherwise identical script: **on this dev machine,
+`import lightgbm` after `import pandas` has already loaded its native extensions
+reliably segfaults on any data at all; importing `lightgbm` first fixes it completely**
+— a DLL/native-runtime conflict specific to this Windows environment, not a code bug.
+Fixed by adding `import lightgbm` as the literal first import (before `pandas`/`sys.path`
+setup/anything from `src`) in every entry point that trains or predicts:
+`scripts/phase4_train_and_decide.py`, `scripts/run_pipeline.py`, and `src/model.py`
+itself (defensive, in case it's ever imported first by something else). Also hardened
+`src/model.py`'s `train_oof`/`predict_with_fold_models` to force
+`np.ascontiguousarray(..., dtype=np.float64)` on `X`/`y` regardless — didn't fix this
+particular crash on its own, but is cheap insurance against a real, separate class of
+bug (`.values` on a multi-dtype-block DataFrame can hand back a non-contiguous array).
+**This would have hit the real Phase 4 training run too** — caught before spending the
+real 33-minute feature build's output on a crash.
+
+Added `lightgbm==4.7.0` (MIT) and `scikit-learn==1.5.1` (BSD-3-Clause) to
+`requirements.txt` with their licenses noted.
+
+### Next
+Run `scripts.phase4_train_and_decide` on the real completed features (India + US) and
+report val F0.5/precision/recall/singleton accuracy, overall and per country.

@@ -17,16 +17,27 @@ backed) -- fast enough to run row-wise in Python at millions-of-pairs scale
 without a vectorization trick.
 """
 
+import gc
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 
-from . import normalize
+from . import io_utils, normalize
 
 _DIGIT_RUN_RE = re.compile(r"\d+")
+
+# Rows per in-memory pandas batch while streaming base features (see
+# build_base_features_streaming). Sized so a handful of python-string
+# intermediate lists per batch stay well under 1GB -- this pipeline has run
+# on an 8GB machine seen as low as ~250MB free with nothing but the OS +
+# browser/editor running (PROJECT_LOG.md, Phase 4).
+STREAMING_CHUNK_SIZE = 100_000
 
 BLOCK_NAMES = ["b1_exact_core", "b2_rare_token", "b3_postal_minor", "b_sorted_neighborhood", "bgeo_address_token"]
 
@@ -60,15 +71,25 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute every pairwise + context feature for one country's pairs.
+CONTEXT_FEATURE_COLUMNS = ["rank_by_s1", "gap_to_best_by_s1", "reverse_rank"]
+BASE_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c not in CONTEXT_FEATURE_COLUMNS]
+
+
+def build_pair_features_base(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute every PAIRWISE (non-context) feature for one chunk of pairs.
+
+    Split out from the context features (rank_by_s1 / gap_to_best_by_s1 /
+    reverse_rank) on purpose: those need the FULL candidate pool for a given
+    s1_id/cand_id to be meaningful, so they can't be computed correctly on an
+    arbitrary row-chunk (see add_context_features). This function is safe to
+    call chunk-by-chunk to bound peak memory on large countries.
 
     Inputs: pairs (s1_id, cand_id, blocks[comma list], n_blocks -- from
     src.blocking's tagged/capped output), s1_df / cand_df (already carrying
     name_full/name_core from blocking.add_normalized_columns, plus
     business_address, entity_id, and a postal_code column).
-    Output: a new DataFrame, same row order as `pairs`, with FEATURE_COLUMNS
-    plus the original s1_id/cand_id for joining back.
+    Output: a new DataFrame, same row order as `pairs`, with
+    BASE_FEATURE_COLUMNS plus s1_id/cand_id for joining back.
     """
     s1_idx = s1_df.set_index("entity_id")
     cand_idx = cand_df.set_index("entity_id")
@@ -149,14 +170,135 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.Da
     result = pd.DataFrame(out)
     result["s1_id"] = pairs["s1_id"].values
     result["cand_id"] = pairs["cand_id"].values
-
-    result["rank_by_s1"] = (
-        result.groupby("s1_id")["name_full_ratio"].rank(method="first", ascending=False).astype(np.float32)
-    )
-    best_by_s1 = result.groupby("s1_id")["name_full_ratio"].transform("max")
-    result["gap_to_best_by_s1"] = (best_by_s1 - result["name_full_ratio"]).astype(np.float32)
-    result["reverse_rank"] = (
-        result.groupby("cand_id")["name_full_ratio"].rank(method="first", ascending=False).astype(np.float32)
-    )
-
     return result
+
+
+def add_context_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add rank_by_s1 / gap_to_best_by_s1 / reverse_rank to a FULL (unchunked)
+    pairs+base-features dataframe for one country.
+
+    Must see every pair for every s1_id and every cand_id at once -- these
+    features measure a candidate's competition, so splitting an id's rows
+    across calls would silently corrupt them. Callers with a large country
+    should prefer running this via DuckDB window functions over the on-disk
+    base-features parquet instead (see scripts/phase4_build_features.py),
+    which spills to disk instead of holding it all in pandas.
+
+    Inputs: dataframe with s1_id, cand_id, name_full_ratio columns.
+    Output: same dataframe (copy) with CONTEXT_FEATURE_COLUMNS added.
+    """
+    df = df.copy()
+    df["rank_by_s1"] = (
+        df.groupby("s1_id")["name_full_ratio"].rank(method="first", ascending=False).astype(np.float32)
+    )
+    best_by_s1 = df.groupby("s1_id")["name_full_ratio"].transform("max")
+    df["gap_to_best_by_s1"] = (best_by_s1 - df["name_full_ratio"]).astype(np.float32)
+    df["reverse_rank"] = (
+        df.groupby("cand_id")["name_full_ratio"].rank(method="first", ascending=False).astype(np.float32)
+    )
+    return df
+
+
+def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+    """Convenience wrapper: base + context features in one call, for small/
+    already-in-memory inputs (unit tests, small ad-hoc checks). Real
+    country-scale runs use build_base_features_streaming +
+    add_context_features_via_duckdb instead (see below), used by both the
+    Phase 4 validation-slice build and scripts/run_pipeline.py's real
+    train/test build.
+    """
+    return add_context_features(build_pair_features_base(pairs, s1_df, cand_df))
+
+
+def build_base_features_streaming(
+    pairs_path: Path, s1_c: pd.DataFrame, cand_c: pd.DataFrame, out_path: Path,
+    label_map: dict = None, country: str = None, chunk_size: int = STREAMING_CHUNK_SIZE,
+) -> tuple:
+    """Stream one country's candidate pairs from parquet in `chunk_size`-row
+    batches, computing base (non-context) features per batch and appending
+    straight to out_path -- never materializes the whole country's pairs
+    table in pandas at once (the fix for a real OOM crash on 6.7M India
+    rows once free system RAM dropped under ~500MB; see PROJECT_LOG.md).
+
+    Inputs: path to a capped-candidate-pairs parquet (s1_id, cand_id, blocks,
+    n_blocks columns), that country's normalized s1/candidate frames,
+    destination parquet path for the base features, an optional
+    {s1_id: set(true_cand_id)} label map (omit entirely -- no "label" column
+    written -- when there is no ground truth, e.g. real test-set inference),
+    optional country tag to stamp on every row, batch size override.
+    Output: (n_rows, n_positives_or_None) written.
+    """
+    pf = pq.ParquetFile(pairs_path)
+    writer = None
+    n_rows = 0
+    n_pos = 0 if label_map is not None else None
+    try:
+        for batch in pf.iter_batches(batch_size=chunk_size, columns=["s1_id", "cand_id", "blocks", "n_blocks"]):
+            chunk = batch.to_pandas()
+            feat = build_pair_features_base(chunk, s1_c, cand_c)
+            if label_map is not None:
+                feat["label"] = [
+                    1 if cid in label_map.get(sid, ()) else 0 for sid, cid in zip(feat["s1_id"], feat["cand_id"])
+                ]
+                n_pos += int(feat["label"].sum())
+            if country is not None:
+                feat["country"] = country
+
+            table = pa.Table.from_pandas(feat, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema)
+            writer.write_table(table)
+
+            n_rows += len(feat)
+            del chunk, feat, table
+            gc.collect()
+    finally:
+        if writer is not None:
+            writer.close()
+    return n_rows, n_pos
+
+
+def add_context_features_via_duckdb(base_path: Path, out_path: Path) -> None:
+    """Second pass: rank_by_s1 / gap_to_best_by_s1 / reverse_rank as DuckDB
+    window functions over the on-disk base-features file for one country.
+
+    DuckDB spills past its memory_limit to DUCKDB_TMP_DIR rather than holding
+    the whole (potentially several-million-row) file in RAM, unlike the
+    pandas groupby add_context_features uses. Reads/writes parquet directly;
+    the Python process only holds the query plan, not the data.
+    """
+    con = io_utils.get_connection()
+    try:
+        con.execute(
+            f"""
+            COPY (
+                SELECT *,
+                    ROW_NUMBER() OVER (PARTITION BY s1_id ORDER BY name_full_ratio DESC) AS rank_by_s1,
+                    (MAX(name_full_ratio) OVER (PARTITION BY s1_id) - name_full_ratio) AS gap_to_best_by_s1,
+                    ROW_NUMBER() OVER (PARTITION BY cand_id ORDER BY name_full_ratio DESC) AS reverse_rank
+                FROM read_parquet('{base_path.as_posix()}')
+            ) TO '{out_path.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+    finally:
+        con.close()
+
+
+def build_country_features(
+    pairs_path: Path, s1_c: pd.DataFrame, cand_c: pd.DataFrame, out_path: Path,
+    label_map: dict = None, country: str = None, chunk_size: int = STREAMING_CHUNK_SIZE,
+) -> tuple:
+    """One country's full feature build: stream base features to a temp file,
+    then add context features via DuckDB, writing the final `out_path`.
+
+    This is the memory-safe entry point real callers should use (see
+    scripts/phase4_build_features.py and scripts/run_pipeline.py) instead of
+    calling the two steps above directly.
+
+    Output: (n_rows, n_positives_or_None), same as build_base_features_streaming.
+    """
+    base_path = out_path.with_name(f"_basefeat_{out_path.name}")
+    n_rows, n_pos = build_base_features_streaming(pairs_path, s1_c, cand_c, base_path, label_map, country, chunk_size)
+    add_context_features_via_duckdb(base_path, out_path)
+    base_path.unlink(missing_ok=True)
+    return n_rows, n_pos
