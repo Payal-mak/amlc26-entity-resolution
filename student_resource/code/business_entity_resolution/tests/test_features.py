@@ -103,3 +103,41 @@ class TestNameFeatures(unittest.TestCase):
         self.assertEqual(out.loc[0, "name_nospace_ratio"], 100.0)   # "jarluspmv" vs "jarlus pmv" with spaces removed
         self.assertEqual(out.loc[1, "name_clean_full_ratio"], 100.0)  # "(ID: 28974)" stripped
         self.assertEqual(out.loc[1, "name_core_containment"], 1.0)
+
+
+class TestRarityFeatures(unittest.TestCase):
+    def _frames(self):
+        def rec(i, name, addr):
+            return {"entity_id": i, "business_name": name, "business_address": addr, "country": "US",
+                    "name_full": name.lower(), "name_core": name.lower(), "postal_code": None}
+        s1 = pd.DataFrame([rec("S1-1", "Zyxel Acme", "5 Main Street, Austin, TX"),
+                           rec("S1-2", "Acme Zorbo", "9 Elm Street, Austin, TX")])
+        # "acme" is in every name (common), "zyxel" only in two (rare).
+        cand = pd.DataFrame([rec("S2-1", "Zyxel Acme", "5 Main Street, Austin, TX"),
+                             rec("S2-2", "Acme Zorbo", "9 Elm Street, Austin, TX"),
+                             rec("S2-3", "Qwerty Plumbing", "5 Main Street, Austin, TX")])
+        return s1, cand
+
+    def test_rare_shared_token_outweighs_common_one(self):
+        s1, cand = self._frames()
+        pairs = pd.DataFrame({"s1_id": ["S1-1", "S1-2"], "cand_id": ["S2-1", "S2-1"], "blocks": ["x", "x"], "n_blocks": [1, 1]})
+        out = features.build_pair_features_base(pairs, s1, cand)
+        # S1-1 vs S2-1: identical names, all tokens shared -> 1.0
+        self.assertAlmostEqual(out.loc[0, "name_idf_jaccard"], 1.0, places=5)
+        # S1-2 vs S2-1: only the common token "acme" is shared -> low weighted overlap
+        self.assertLess(out.loc[1, "name_idf_jaccard"], 0.35)
+        self.assertGreater(out.loc[0, "name_max_shared_idf"], out.loc[1, "name_max_shared_idf"])
+
+    def test_no_shared_token_is_zero(self):
+        s1, cand = self._frames()
+        pairs = pd.DataFrame({"s1_id": ["S1-1"], "cand_id": ["S2-3"], "blocks": ["x"], "n_blocks": [1]})
+        out = features.build_pair_features_base(pairs, s1, cand)
+        self.assertEqual(out.loc[0, "name_idf_jaccard"], 0.0)
+        self.assertEqual(out.loc[0, "name_idf_containment"], 0.0)
+
+    def test_same_address_low_name_flag(self):
+        s1, cand = self._frames()
+        pairs = pd.DataFrame({"s1_id": ["S1-1", "S1-1"], "cand_id": ["S2-3", "S2-1"], "blocks": ["x", "x"], "n_blocks": [1, 1]})
+        out = features.build_pair_features_base(pairs, s1, cand)
+        self.assertEqual(out.loc[0, "same_addr_low_name"], 1.0)  # same address, unrelated name
+        self.assertEqual(out.loc[1, "same_addr_low_name"], 0.0)  # same address, same name

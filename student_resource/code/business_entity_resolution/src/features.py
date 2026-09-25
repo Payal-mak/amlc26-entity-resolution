@@ -18,7 +18,9 @@ without a vectorization trick.
 """
 
 import gc
+import math
 import re
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +57,8 @@ FEATURE_COLUMNS = [
     # Name cleanup + containment (commit B).
     "name_clean_full_ratio", "name_clean_core_ratio", "name_nospace_ratio", "name_nospace_partial_ratio",
     "name_core_containment",
+    # Rarity (commit C).
+    "name_idf_jaccard", "name_idf_containment", "name_max_shared_idf", "same_addr_low_name",
     "rank_by_s1", "gap_to_best_by_s1", "reverse_rank",
 ]
 
@@ -77,6 +81,10 @@ def _jaccard(a: set, b: set) -> float:
         return 0.0
     return len(a & b) / len(a | b)
 
+
+SAME_ADDR_STREET_MIN = 90   # street_token_set_ratio at or above this counts as "same street text"
+LOW_NAME_IDF_MAX = 0.2      # name_idf_jaccard below this = no meaningful rare-token overlap
+LOW_NAME_NOSPACE_MAX = 60   # name_nospace_ratio below this = names look unrelated
 
 HN_BOTH_MISSING, HN_EQUAL, HN_PREFIX_SUFFIX, HN_ONE_EDIT, HN_ONE_MISSING, HN_CONFLICT = range(6)
 
@@ -152,6 +160,19 @@ def prepare_entities(s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame
     prep["name_core_c"] = name_core
     prep["name_nospace"] = [n.replace(" ", "") for n in name_full]
     prep["core_tokens"] = [frozenset(n.split()) for n in name_core]
+
+    # Token rarity: IDF over THIS country's S1+S2+S3 names (every entity in
+    # both frames counts once; no labels). Scaled by ln(N+1) so weights sit in
+    # [0, 1) whatever the corpus size -- the validation slice, the full train
+    # set and the test set then produce comparable overlap ratios.
+    n_entities = len(prep)
+    doc_freq = Counter()
+    for toks in prep["core_tokens"]:
+        doc_freq.update(toks)
+    scale = math.log(n_entities + 1) or 1.0
+    idf = {t: math.log((n_entities + 1) / (c + 1)) / scale for t, c in doc_freq.items()}
+    prep["idf_sum"] = [sum(idf[t] for t in toks) for toks in prep["core_tokens"]]
+    prep.attrs["idf"] = idf
     return prep
 
 
@@ -313,6 +334,35 @@ def build_pair_features_base(
     out["name_core_containment"] = np.fromiter(
         (_containment(a, b) for a, b in zip(p1["core_tokens"], p2["core_tokens"])), dtype=np.float32, count=n
     )
+
+    idf = prep.attrs["idf"]
+    jac = np.zeros(n, dtype=np.float32)
+    cont = np.zeros(n, dtype=np.float32)
+    max_shared = np.zeros(n, dtype=np.float32)
+    for i, (ta, tb, sa, sb) in enumerate(zip(p1["core_tokens"], p2["core_tokens"], p1["idf_sum"], p2["idf_sum"])):
+        shared = ta & tb
+        if not shared:
+            continue
+        weights = [idf[t] for t in shared]
+        inter = sum(weights)
+        union = sa + sb - inter
+        jac[i] = inter / union if union > 0 else 0.0
+        smaller = min(sa, sb)
+        cont[i] = inter / smaller if smaller > 0 else 0.0
+        max_shared[i] = max(weights)
+    out["name_idf_jaccard"] = jac
+    out["name_idf_containment"] = cont
+    out["name_max_shared_idf"] = max_shared
+
+    # Same place, different-looking name: street text matches and the house
+    # numbers don't disagree, yet the names share no rare token and the
+    # spaces-removed names are far apart (a renamed/garbled name at a shared
+    # address -- or two unrelated businesses at one address; the model decides).
+    same_addr = (out["street_token_set_ratio"] >= SAME_ADDR_STREET_MIN) & np.isin(
+        rel, (HN_EQUAL, HN_PREFIX_SUFFIX, HN_ONE_EDIT)
+    )
+    low_name = (jac < LOW_NAME_IDF_MAX) & (out["name_nospace_ratio"] < LOW_NAME_NOSPACE_MAX)
+    out["same_addr_low_name"] = (same_addr & low_name).astype(np.float32)
 
     result = pd.DataFrame(out)
     result["s1_id"] = pairs["s1_id"].values
