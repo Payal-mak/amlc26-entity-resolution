@@ -500,10 +500,21 @@ def block_b_sorted_neighborhood(
     return out
 
 
-def block_b_geo(con: duckdb.DuckDBPyConnection, s1_geo_view: str, cand_geo_view: str) -> str:
+def block_b_geo(
+    con: duckdb.DuckDBPyConnection, s1_geo_view: str, cand_geo_view: str, max_cand_token_df: int = config.GEO_MAX_CAND_TOKEN_DF
+) -> str:
     """B_geo: shared rarest in-country address token, capped at PER_BLOCK_CAP
     per S1 (score = 1/geo_df, so a shared rare locality token ranks above a
     shared common one). Returns the output table name.
+
+    max_cand_token_df (recall-v2, added after a real Kaggle full-train-scale
+    OOM -- see config.GEO_MAX_CAND_TOKEN_DF's docstring): excludes candidates
+    whose OWN chosen geo_token has candidate-side document frequency above
+    this, from the JOIN condition itself -- same principle as B2's
+    B2_MAX_CAND_TOKEN_DF, and for the same reason: the expensive part is the
+    join's fan-out on a too-common token, which happens before the
+    `rn <= PER_BLOCK_CAP` cut below could ever discard the excess rows, so
+    that cut alone doesn't bound the actual work done.
     """
     out = "bgeo_pairs"
     con.execute(
@@ -513,7 +524,7 @@ def block_b_geo(con: duckdb.DuckDBPyConnection, s1_geo_view: str, cand_geo_view:
             SELECT s.entity_id AS s1_id, c.entity_id AS cand_id,
                    ROW_NUMBER() OVER (PARTITION BY s.entity_id ORDER BY (1.0 / c.geo_df) DESC, c.entity_id) AS rn
             FROM {s1_geo_view} s JOIN {cand_geo_view} c
-              ON s.country = c.country AND s.geo_token = c.geo_token
+              ON s.country = c.country AND s.geo_token = c.geo_token AND c.geo_df <= {max_cand_token_df}
         )
         WHERE rn <= {PER_BLOCK_CAP}
         """

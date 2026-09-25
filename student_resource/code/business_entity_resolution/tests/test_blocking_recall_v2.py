@@ -115,5 +115,70 @@ class TestBlockAddressRareTokens(unittest.TestCase):
         self.assertIsNone(blocking.extract_house_number(None))
 
 
+class TestBlockGeoDfCap(unittest.TestCase):
+    """block_b_geo's max_cand_token_df cap (recall-v2, added after a real
+    Kaggle full-train-scale OOM -- see config.GEO_MAX_CAND_TOKEN_DF's
+    docstring). Excludes a candidate from the JOIN entirely if its own
+    chosen geo_token's candidate-side document frequency is above the cap --
+    same principle as B2_MAX_CAND_TOKEN_DF, checked in the join condition so
+    the expensive fan-out never happens, not just filtered out afterward.
+    """
+
+    def _setup(self, con):
+        s1 = pd.DataFrame(
+            {
+                "entity_id": ["S1-rare", "S1-common"],
+                "country": ["US", "US"],
+                "business_address": ["1 Raretown Road", "2 Commonplaza Road"],
+            }
+        )
+        # "raretown" appears exactly 3x on the candidate side (passes
+        # MIN_GEO_TOKEN_DF=3); "commonplaza" appears 4x -- both qualify as
+        # SOME record's rarest available token, but commonplaza is the one
+        # a tight cap should exclude.
+        cand = pd.DataFrame(
+            {
+                "entity_id": [f"S2-{i}" for i in range(7)],
+                "country": ["US"] * 7,
+                "business_address": (
+                    ["1 Raretown Road"] * 3 + ["2 Commonplaza Road"] * 4
+                ),
+            }
+        )
+        con.register("s1v", s1)
+        con.register("candv", cand)
+        # register_geo_tokens computes each token's df WITHIN the table it's
+        # given -- MIN_GEO_TOKEN_DF=3 (the real default) would exclude every
+        # token on this 2-row S1 table outright (nothing repeats 3x there),
+        # unrelated to the cap this test is actually about.
+        orig_min = blocking.MIN_GEO_TOKEN_DF
+        blocking.MIN_GEO_TOKEN_DF = 1
+        try:
+            blocking.register_geo_tokens(con, "s1v", "s1geo")
+            blocking.register_geo_tokens(con, "candv", "candgeo")
+        finally:
+            blocking.MIN_GEO_TOKEN_DF = orig_min
+
+    def test_tight_cap_excludes_common_token_but_keeps_rare_one(self):
+        con = _con()
+        self._setup(con)
+        out = blocking.block_b_geo(con, "s1geo", "candgeo", max_cand_token_df=3)
+        pairs = set(map(tuple, con.execute(f"SELECT s1_id, cand_id FROM {out}").fetchdf().values))
+        rare_pairs = {p for p in pairs if p[0] == "S1-rare"}
+        common_pairs = {p for p in pairs if p[0] == "S1-common"}
+        self.assertEqual(len(rare_pairs), 3)  # raretown, df=3 <= cap
+        self.assertEqual(len(common_pairs), 0)  # commonplaza, df=4 > cap -- excluded
+        con.close()
+
+    def test_loose_cap_keeps_both(self):
+        con = _con()
+        self._setup(con)
+        out = blocking.block_b_geo(con, "s1geo", "candgeo", max_cand_token_df=10)
+        pairs = set(map(tuple, con.execute(f"SELECT s1_id, cand_id FROM {out}").fetchdf().values))
+        common_pairs = {p for p in pairs if p[0] == "S1-common"}
+        self.assertEqual(len(common_pairs), 4)  # df=4 <= cap=10 -- now included
+        con.close()
+
+
 if __name__ == "__main__":
     unittest.main()

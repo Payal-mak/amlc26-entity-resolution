@@ -976,3 +976,116 @@ extra feature-build/training compute on the next Kaggle run, not free.
   existing "a few hours, likely fitting one Kaggle session but not by a wide margin"
   estimate should now be read as tighter, not looser; `--stage <name>` resume is the
   safety net if a session times out mid-run.
+
+## 2026-09-25 — First real Kaggle run: val stages worked, train_features OOM'd in block_b_geo
+
+### The run
+Kaggle cloned `main` (recall-v2 not merged yet) and ran `scripts/run_pipeline.py --stage
+all`. `val_slice`/`val_blocking`/`val_features`/`val_train` all completed: macro F0.5
+**0.8704**, precision 0.9817, recall 0.7492 (pre-recall-v2 blocking, on the 45k
+validation slice). `train_features` then crashed on India after 3500s:
+`_duckdb.OutOfMemoryException` inside `block_b_geo`, hitting `max_temp_directory_size`
+at "27.9 GiB/27.9 GiB used" -- not real disk exhaustion (Kaggle's `/tmp` has 1TB+ free),
+the OLD 30GB default (sized for this local machine's 3-5GB-free C: drive) was never
+raised for Kaggle's real scale. Full India train scale: 883k S1 / 4.1M candidates --
+~5x every recall-v2 measurement above, which all ran at the 185k/658k validation-slice
+scale. Test is close to the same size (test_source1 alone is 1,732,544 rows, bigger than
+full India train), so `test_features` would have hit the identical wall.
+
+### Root cause: block_b_geo had no candidate-side DF cap, unlike B2
+`register_geo_tokens` picks each record's own rarest AVAILABLE token, but nothing ever
+bounded how common that token could be across the whole candidate pool -- a locality
+name that's merely the least-bad option for a sparse address can still have a huge
+candidate-side document frequency, and the join fans out on it in full before the
+existing `rn <= PER_BLOCK_CAP` cut (which only trims the RESULT, too late to bound the
+work). Exactly the class of bug this whole module was redesigned around (see its
+docstring) -- just never applied to this one block, and never triggered before because
+the validation slice's smaller scale happened to stay under whatever the real ceiling
+was.
+
+### Fixes (recall-v2 branch, then merged to main -- see below)
+1. **`block_b_geo` candidate-side DF cap** (`config.GEO_MAX_CAND_TOKEN_DF`, default
+   3000, same principle as `B2_MAX_CAND_TOKEN_DF`): excludes a candidate from the JOIN
+   itself (not just the post-join rank cut) if its chosen geo_token's candidate-side df
+   exceeds this. Untuned -- chosen as a safety margin under time pressure, not swept
+   (this scale doesn't fit locally at all); override via `AML_GEO_MAX_CAND_TOKEN_DF` /
+   `--geo-max-cand-token-df` if it needs adjusting.
+2. **S1 batching for every block** (`config.S1_BATCH_SIZE`, default 100,000 --
+   `AML_S1_BATCH_SIZE` / `--s1-batch-size`): `build_country_pairs_and_features` now
+   processes each country in S1 batches, so every block's join input is bounded by (one
+   batch) x (the full candidate pool), never (an entire country, e.g. 883k for India) x
+   (4.1M) at once. Each batch writes its own `features_{country}_{batch:03d}.parquet` /
+   `capped_{country}_{batch:03d}.parquet` -- the existing `features_*.parquet` /
+   `capped_*.parquet` globs in `stage_train`/`stage_predict`/`stage_write` already pick
+   up multiple files per country with no further changes needed.
+3. **`DUCKDB_MAX_TEMP_DIRECTORY_SIZE` 30GB -> 200GB** default -- the actual thing that
+   hit first tonight, independent of both fixes above.
+4. **Checkpointing to a persistent dir** (`config.CKPT_DIR`, `AML_CKPT_DIR` /
+   `--ckpt-dir`, e.g. `/kaggle/working/ckpt`): each batch's output files (and the
+   trained model / train report) are mirrored there after being written, and restored
+   from there at the START of that batch/stage if missing from `--work-dir` (which is
+   `/tmp/...` on Kaggle -- wiped on a session restart, unlike `/kaggle/working`). A
+   batch whose checkpoint already exists is skipped entirely rather than recomputed --
+   the resume story for a crash partway through a long `train_features`/`test_features`
+   run. Smoke-tested end to end on synthetic data: batching produces correct per-batch
+   pair/feature/positive counts, wiping `--work-dir` and rerunning correctly restores
+   every batch from `--ckpt-dir` instead of recomputing (confirmed via the "already done
+   (checkpoint), skipping" log line), and the same restore works for the trained model.
+5. **`--skip-full-train`**: skips `train_features`/`train` entirely (from `--stage
+   all`'s order) and predicts test with the `val_train` (validation-slice) model
+   instead, for a fast first submission. Needed `scripts/phase4_train_and_decide.py` to
+   actually persist its fold models (it didn't before -- `VAL_MODEL_PATH`, always
+   written now); `stage_val_train` copies that to the same `MODEL_PATH` `stage_predict`
+   already reads, plus writes `TRAIN_REPORT_PATH`, both also checkpointed. Verified
+   against the real (if blocking-stale) existing validation-slice features already on
+   disk: model + report both landed at the right paths, `stage_predict` picked them up
+   correctly (including after deleting them locally and confirming checkpoint restore).
+
+Added a `block_b_geo` DF-cap unit test (tiny synthetic data, `MIN_GEO_TOKEN_DF`
+monkeypatched down since a 2-row table can't naturally reach its real df=3 floor) --
+confirms a tight cap excludes an overly-common token from the join while a loose one
+doesn't, both without touching the actual PER_BLOCK_CAP row-limit logic. 53 tests total,
+all passing.
+
+### Also: merged recall-v2 into main, tagged the old main as `v1-baseline`
+Kaggle clones `main`, so recall-v2's four blocking fixes (0.7907 -> 0.9117 capped recall,
+see the recall-v2 entry above) plus tonight's memory fixes needed to land there.
+`v1-baseline` tags the pre-merge commit for version history.
+
+### Tonight's Kaggle command
+```
+python -m scripts.run_pipeline \\
+    --data-dir /kaggle/input/<dataset-name>/dataset \\
+    --work-dir /tmp/work \\
+    --output-dir /kaggle/working/output \\
+    --ckpt-dir /kaggle/working/ckpt \\
+    --duckdb-memory 20GB --duckdb-threads 4 \\
+    --skip-full-train --disable-tfidf-block \\
+    --stage all
+```
+`--skip-full-train` reruns `val_blocking`/`val_features`/`val_train` fresh (so the OOF
+number reflects recall-v2's actual blocking, not the stale 0.8704 above), skips
+`train_features`/`train`, then goes straight to `test_features` -> `predict` -> `write`.
+`--disable-tfidf-block` because B_tfidf's full-scale cost is still genuinely untested at
+this size -- re-enable on a later run once there's time to watch it closely.
+
+### Time estimate (honestly hedged, not measured at this exact configuration)
+The 3500s-to-crash datapoint isn't a clean baseline for the new number: it ran the OLD
+5-block/DF=150 pipeline UNbatched, and crashed before finishing India, so it's a lower
+bound on the old config's cost, not a real measurement of the new one. Working
+estimate, several real variables pulling in different directions (recall-v2's DF=2000
+join is heavier per batch; B_address is a new but cheap block; batching adds ~9x
+redundant candidate-side setup for India's 9 batches; B_tfidf is off tonight, removing
+its cost entirely) -- plausibly similar order of magnitude to the original crash's pace
+per country, so **rough order of 1-2 hours for `train_features`... except it's SKIPPED
+tonight**, and `test_features` (test_source1 is bigger than full India train alone)
+is the real cost, plausibly **1-3 hours**. Watch the per-batch log lines
+(`country=... batch=X/Y: ... (Ns)`) early to react if it's running far outside this
+range -- `--ckpt-dir` means a restart doesn't lose completed batches either way.
+
+### Next
+Watch the Kaggle log's `val_blocking`/`val_train` numbers first (should already look
+like recall-v2's local measurements, modulo B_tfidf being off) -- if they don't, stop
+and investigate before letting `test_features` run for hours. Once `write` completes,
+run `utils/validate_submission.py`'s output through a final human sanity check before
+actually submitting.
