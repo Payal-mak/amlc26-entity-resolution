@@ -106,6 +106,51 @@ def expand_abbreviations(text: str) -> str:
     return " ".join(ABBREVIATIONS.get(tok, tok) for tok in text.split(" ") if tok)
 
 
+# Address-side abbreviations: the generic street words from ABBREVIATIONS
+# (never the legal-entity ones like "inc"/"co", which mean something else in an
+# address) plus a few more street/place words. Language-level, not
+# country-specific -- both sides of every comparison go through the same map,
+# so an ambiguous token ("st", "ct") only has to be consistent, not correct.
+ADDRESS_ABBREVIATIONS = {
+    **{k: v for k, v in ABBREVIATIONS.items() if k in {"rd", "st", "ave", "blvd", "dr", "ln", "ct", "pl", "apt", "ste", "hwy", "pkwy"}},
+    "cir": "circle", "sq": "square", "ter": "terrace", "trl": "trail", "expy": "expressway",
+    "rte": "route", "bldg": "building", "nr": "near", "opp": "opposite",
+}
+
+
+def expand_address_abbreviations(text: str) -> str:
+    """Whole-token expansion of ADDRESS_ABBREVIATIONS on a basic_clean'd address."""
+    return " ".join(ADDRESS_ABBREVIATIONS.get(tok, tok) for tok in text.split(" ") if tok)
+
+
+def street_key(address: str) -> str:
+    """Address with every number removed and abbreviations expanded.
+
+    Input: raw business_address (or None). Output: lowercase text made of the
+    address's non-numeric tokens only (any token containing a digit is dropped:
+    house/unit/plot numbers, PIN/ZIP codes, "c-440" style codes), e.g.
+    "7800 Valburn Dr, Austin, TX" -> "valburn drive austin tx". Used to compare
+    the street/locality part of two addresses when their house numbers are
+    truncated, mistyped or missing.
+    """
+    tokens = [t for t in basic_clean(address).split(" ") if t and not any(c.isdigit() for c in t)]
+    return expand_address_abbreviations(" ".join(tokens))
+
+
+def house_numbers(address: str, postal_code: str = None) -> tuple:
+    """All digit runs in an address (leading zeros stripped), postal code excluded.
+
+    Input: raw address, and optionally its already-extracted postal code (one
+    run equal to it is dropped, so two different houses in the same ZIP/PIN
+    don't look like an "equal number"). Output: tuple of digit strings, in
+    order of appearance ("03153 Twelve Oaks" -> ("3153",)).
+    """
+    runs = re.findall(r"\d+", address or "")
+    if postal_code and postal_code in runs:
+        runs.remove(postal_code)
+    return tuple(r.lstrip("0") or "0" for r in runs)
+
+
 def normalize_full(text: str, translit_map: dict = None) -> str:
     """Transliterate (if needed) + basic_clean + abbreviation expansion.
 

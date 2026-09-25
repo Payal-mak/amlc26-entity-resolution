@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
 from . import io_utils, normalize
@@ -48,6 +48,10 @@ FEATURE_COLUMNS = [
     "postal_equal", "postal_conflict", "postal_missing",
     "n_blocks", *[f"block_{b}" for b in BLOCK_NAMES],
     "source_is_s2", "name_full_len_diff",
+    # Address (features-address-name branch, commit A): house-number
+    # compatibility one-hots + street similarity with numbers removed.
+    "hn_equal", "hn_prefix_suffix", "hn_one_edit", "hn_one_missing", "hn_conflict", "hn_both_missing",
+    "street_ratio", "street_token_set_ratio", "street_token_sort_ratio",
     "rank_by_s1", "gap_to_best_by_s1", "reverse_rank",
 ]
 
@@ -71,11 +75,79 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
+HN_BOTH_MISSING, HN_EQUAL, HN_PREFIX_SUFFIX, HN_ONE_EDIT, HN_ONE_MISSING, HN_CONFLICT = range(6)
+
+
+def _one_edit_apart(x: str, y: str) -> bool:
+    """True if x and y (digit strings, len >= 3) differ by exactly one
+    substitution, insertion or deletion."""
+    if abs(len(x) - len(y)) > 1 or min(len(x), len(y)) < 3 or x == y:
+        return False
+    if len(x) == len(y):
+        return sum(1 for a, b in zip(x, y) if a != b) == 1
+    short, long_ = (x, y) if len(x) < len(y) else (y, x)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def house_number_relation(a: tuple, b: tuple) -> int:
+    """Compatibility of two addresses' house numbers (tuples from
+    normalize.house_numbers). Returns one of HN_* codes, checked in this order:
+    both empty / exactly one digit run shared / one run is a prefix or suffix
+    of another (min 2 digits: "6104" vs "104", "16549" vs "1654") / one edit
+    apart ("7800" vs "7802") / exactly one side has no number at all / no
+    number in common (conflict).
+    """
+    if not a and not b:
+        return HN_BOTH_MISSING
+    if not a or not b:
+        return HN_ONE_MISSING
+    sa, sb = set(a), set(b)
+    if sa & sb:
+        return HN_EQUAL
+    for x in sa:
+        for y in sb:
+            if min(len(x), len(y)) >= 2 and (x.startswith(y) or x.endswith(y) or y.startswith(x) or y.endswith(x)):
+                return HN_PREFIX_SUFFIX
+    for x in sa:
+        for y in sb:
+            if _one_edit_apart(x, y):
+                return HN_ONE_EDIT
+    return HN_CONFLICT
+
+
+def prepare_entities(s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-ENTITY derived fields for one country, computed once (not per pair
+    -- pairs outnumber entities ~37:1) and indexed by entity_id.
+
+    Inputs: that country's s1 and candidate frames (entity_id, business_name,
+    business_address, postal_code, name_full, name_core, country).
+    Output: DataFrame indexed by entity_id with the columns the pair-level
+    features gather from.
+    """
+    both = pd.concat([s1_df, cand_df], ignore_index=True)
+    prep = pd.DataFrame(index=pd.Index(both["entity_id"].values, name="entity_id"))
+    prep["street"] = both["business_address"].map(normalize.street_key).values
+    prep["hn"] = [
+        normalize.house_numbers(a, pc if isinstance(pc, str) else None)
+        for a, pc in zip(both["business_address"], both["postal_code"])
+    ]
+    return prep
+
+
+def _pairwise(scorer, xs: list, ys: list) -> np.ndarray:
+    """Element-wise rapidfuzz similarity (0-100) of xs[i] vs ys[i], vectorized in C++."""
+    if not xs:
+        return np.empty(0, dtype=np.float32)
+    return process.cpdist(xs, ys, scorer=scorer, dtype=np.float32, workers=1)
+
+
 CONTEXT_FEATURE_COLUMNS = ["rank_by_s1", "gap_to_best_by_s1", "reverse_rank"]
 BASE_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c not in CONTEXT_FEATURE_COLUMNS]
 
 
-def build_pair_features_base(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+def build_pair_features_base(
+    pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame, prep: pd.DataFrame = None
+) -> pd.DataFrame:
     """Compute every PAIRWISE (non-context) feature for one chunk of pairs.
 
     Split out from the context features (rank_by_s1 / gap_to_best_by_s1 /
@@ -88,6 +160,9 @@ def build_pair_features_base(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: 
     src.blocking's tagged/capped output), s1_df / cand_df (already carrying
     name_full/name_core from blocking.add_normalized_columns, plus
     business_address, entity_id, and a postal_code column).
+    `prep` is prepare_entities(s1_df, cand_df); pass it when calling chunk-by-
+    chunk so per-entity work is done once per country, not once per chunk
+    (built here if omitted).
     Output: a new DataFrame, same row order as `pairs`, with
     BASE_FEATURE_COLUMNS plus s1_id/cand_id for joining back.
     """
@@ -167,6 +242,27 @@ def build_pair_features_base(pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: 
 
     out["source_is_s2"] = pairs["cand_id"].str.startswith("S2-").astype(np.float32).values
 
+    if prep is None:
+        prep = prepare_entities(s1_df, cand_df)
+    p1 = prep.loc[pairs["s1_id"].values]
+    p2 = prep.loc[pairs["cand_id"].values]
+
+    rel = np.fromiter((house_number_relation(a, b) for a, b in zip(p1["hn"], p2["hn"])), dtype=np.int8, count=n)
+    out["hn_equal"] = (rel == HN_EQUAL).astype(np.float32)
+    out["hn_prefix_suffix"] = (rel == HN_PREFIX_SUFFIX).astype(np.float32)
+    out["hn_one_edit"] = (rel == HN_ONE_EDIT).astype(np.float32)
+    out["hn_one_missing"] = (rel == HN_ONE_MISSING).astype(np.float32)
+    out["hn_conflict"] = (rel == HN_CONFLICT).astype(np.float32)
+    out["hn_both_missing"] = (rel == HN_BOTH_MISSING).astype(np.float32)
+
+    st1, st2 = p1["street"].tolist(), p2["street"].tolist()
+    either_empty = np.array([(not a) or (not b) for a, b in zip(st1, st2)])
+    for name, scorer in (("street_ratio", fuzz.ratio), ("street_token_set_ratio", fuzz.token_set_ratio),
+                         ("street_token_sort_ratio", fuzz.token_sort_ratio)):
+        v = _pairwise(scorer, st1, st2)
+        v[either_empty] = np.nan  # a blank/number-only address carries no street signal
+        out[name] = v
+
     result = pd.DataFrame(out)
     result["s1_id"] = pairs["s1_id"].values
     result["cand_id"] = pairs["cand_id"].values
@@ -229,13 +325,14 @@ def build_base_features_streaming(
     Output: (n_rows, n_positives_or_None) written.
     """
     pf = pq.ParquetFile(pairs_path)
+    prep = prepare_entities(s1_c, cand_c)
     writer = None
     n_rows = 0
     n_pos = 0 if label_map is not None else None
     try:
         for batch in pf.iter_batches(batch_size=chunk_size, columns=["s1_id", "cand_id", "blocks", "n_blocks"]):
             chunk = batch.to_pandas()
-            feat = build_pair_features_base(chunk, s1_c, cand_c)
+            feat = build_pair_features_base(chunk, s1_c, cand_c, prep)
             if label_map is not None:
                 feat["label"] = [
                     1 if cid in label_map.get(sid, ()) else 0 for sid, cid in zip(feat["s1_id"], feat["cand_id"])

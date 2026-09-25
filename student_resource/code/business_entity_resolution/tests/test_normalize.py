@@ -93,3 +93,30 @@ class TestDevanagari(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAddressHelpers(unittest.TestCase):
+    def test_street_key_drops_numbers_and_expands_abbreviations(self):
+        self.assertEqual(normalize.street_key("7800 Valburn Dr, Austin, TX"), "valburn drive austin tx")
+        self.assertEqual(normalize.street_key("Jefferson City, 1205 Satinwood Drive, MO"), "jefferson city satinwood drive mo")
+
+    def test_street_key_drops_mixed_digit_tokens(self):
+        self.assertEqual(normalize.street_key("C-440 Near Block C, Sushant Lok-I"), "c near block c sushant lok i")
+
+    def test_street_key_expands_new_abbreviations_and_handles_none(self):
+        self.assertEqual(normalize.street_key("12 Las Palmas Cir"), "las palmas circle")
+        self.assertEqual(normalize.street_key(None), "")
+
+    def test_street_key_leaves_legal_abbreviations_alone(self):
+        # "co"/"inc" are business words, not address words
+        self.assertEqual(normalize.street_key("Main St Co"), "main street co")
+
+    def test_house_numbers_strip_leading_zeros(self):
+        self.assertEqual(normalize.house_numbers("03153 Twelve Oaks Boulevard"), ("3153",))
+
+    def test_house_numbers_drop_the_postal_code_once(self):
+        self.assertEqual(normalize.house_numbers("12 Main St 12345", "12345"), ("12",))
+        self.assertEqual(normalize.house_numbers("12345 Main St 12345", "12345"), ("12345",))
+
+    def test_house_numbers_none(self):
+        self.assertEqual(normalize.house_numbers(None), ())
