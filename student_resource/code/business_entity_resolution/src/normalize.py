@@ -145,10 +145,49 @@ def house_numbers(address: str, postal_code: str = None) -> tuple:
     don't look like an "equal number"). Output: tuple of digit strings, in
     order of appearance ("03153 Twelve Oaks" -> ("3153",)).
     """
-    runs = re.findall(r"\d+", address or "")
-    if postal_code and postal_code in runs:
-        runs.remove(postal_code)
-    return tuple(r.lstrip("0") or "0" for r in runs)
+    return tuple(raw.lstrip("0") or "0" for raw, _ in house_number_parts(address, postal_code))
+
+
+# Numbers that label a sub-unit or a mailbox, not the building: "PO Box 3175",
+# "PMB 776", "Unit 6", "Suite 165", "Apt 4B", "Flat No.203", "Fl 3rd", "#12",
+# and "4th Floor". Blanked out before house numbers are read, so
+# "3 Cross Timber" vs "2 Cross Timber, PMB 776" compares 3 vs 2, not 3 vs 776.
+_UNIT_SPAN_RE = re.compile(
+    r"(?:\b(?:p\.?\s?o\.?\s*box|pmb|box|unit|suite|ste|apt|apartment|flat|room|rm|floor|fl|flr)\b|#)"
+    r"\s*[-#.:]?\s*(?:no\.?\s*)?[a-z]?-?\d+(?:st|nd|rd|th)?(?:-\d+)?[a-z]?\b",
+    re.IGNORECASE,
+)
+_ORDINAL_FLOOR_RE = re.compile(r"\b\d+(?:st|nd|rd|th)\s+(?:floor|flr|fl)\b", re.IGNORECASE)
+# "12A", "12 bis", "12 ter": a single letter glued to the number, or a French-style
+# bis/ter/quater word right after it. Ordinals ("4Th") are two letters -> not a suffix.
+_HN_SUFFIX_RE = re.compile(r"(?:\s*(bis|ter|quater)\b|([a-z])(?![a-z0-9]))", re.IGNORECASE)
+_HN_SUFFIX_CANON = {"bis": "b", "ter": "c", "quater": "d"}
+
+
+def house_number_parts(address: str, postal_code: str = None) -> tuple:
+    """Building-number candidates in an address, as (digits, suffix) pairs.
+
+    Input: raw address, and optionally its already-extracted postal code (one
+    run equal to it is dropped). Output: tuple of (raw digit string, lowercase
+    suffix or "") in order of appearance; leading zeros are kept (compare with
+    lstrip("0") for equality, but "302" vs "02" is a dropped-digit case).
+    Unit/box/floor numbers are excluded (see _UNIT_SPAN_RE). Suffix: "12A" ->
+    ("12", "a"); "12 bis" -> ("12", "b"), "12 ter" -> ("12", "c").
+    """
+    text = _ORDINAL_FLOOR_RE.sub(" ", _UNIT_SPAN_RE.sub(" ", address or ""))
+    parts = []
+    for m in re.finditer(r"\d+", text):
+        sm = _HN_SUFFIX_RE.match(text, m.end())
+        sfx = ""
+        if sm:
+            sfx = _HN_SUFFIX_CANON.get((sm.group(1) or "").lower(), (sm.group(2) or "").lower())
+        parts.append((m.group(0), sfx))
+    if postal_code:
+        for i, (raw, _) in enumerate(parts):
+            if raw == postal_code:
+                del parts[i]
+                break
+    return tuple(parts)
 
 
 # --- name decoration cleanup (used for pair-similarity features only) -------

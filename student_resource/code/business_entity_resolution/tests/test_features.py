@@ -40,6 +40,41 @@ class TestHouseNumberRelation(unittest.TestCase):
     def test_conflict(self):
         self.assertEqual(self.rel(("3153",), ("3490",)), features.HN_CONFLICT)
 
+    def test_dropped_leading_digit_kept_as_raw_string(self):
+        self.assertEqual(self.rel(("302",), ("02",)), features.HN_PREFIX_SUFFIX)  # "H.no 02" vs "No.302"
+        self.assertEqual(self.rel(("604",), ("04",)), features.HN_PREFIX_SUFFIX)
+
+    def test_leading_zeros_ignored_for_equality(self):
+        self.assertEqual(self.rel(("03153",), ("3153",)), features.HN_EQUAL)
+
+
+class TestHouseNumberSignals(unittest.TestCase):
+    sig = staticmethod(features.house_number_signals)
+
+    def test_small_difference(self):
+        rel, small, mind, sfx = self.sig((("7800", ""),), (("7802", ""),))
+        self.assertEqual((rel, small, sfx), (features.HN_ONE_EDIT, 1.0, 0.0))
+        self.assertAlmostEqual(mind, np.log10(3))
+        self.assertEqual(self.sig((("169", ""),), (("171", ""),))[1], 1.0)
+
+    def test_large_difference_is_not_small(self):
+        rel, small, mind, _ = self.sig((("3153", ""),), (("3490", ""),))
+        self.assertEqual((rel, small), (features.HN_CONFLICT, 0.0))
+        self.assertAlmostEqual(mind, np.log10(338))
+
+    def test_equal_number_is_not_a_small_difference(self):
+        self.assertEqual(self.sig((("453", ""),), (("453", ""),))[1], 0.0)
+
+    def test_suffix_differs_only_when_both_have_one_and_they_disagree(self):
+        self.assertEqual(self.sig((("12", "a"),), (("12", "b"),))[3], 1.0)
+        self.assertEqual(self.sig((("12", "a"),), (("12", ""),))[3], 0.0)
+        self.assertEqual(self.sig((("12", "b"),), (("12", "b"),))[3], 0.0)
+
+    def test_missing_number_gives_nan_distance(self):
+        rel, small, mind, sfx = self.sig((("12", ""),), ())
+        self.assertEqual((rel, small, sfx), (features.HN_ONE_MISSING, 0.0, 0.0))
+        self.assertTrue(np.isnan(mind))
+
 
 class TestBuildPairFeaturesBase(unittest.TestCase):
     def _frames(self):

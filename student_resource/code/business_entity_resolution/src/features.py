@@ -53,6 +53,7 @@ FEATURE_COLUMNS = [
     # Address (features-address-name branch, commit A): house-number
     # compatibility one-hots + street similarity with numbers removed.
     "hn_equal", "hn_prefix_suffix", "hn_one_edit", "hn_one_missing", "hn_conflict", "hn_both_missing",
+    "hn_small_diff", "hn_min_abs_diff_log", "hn_suffix_differs",
     "street_ratio", "street_token_set_ratio", "street_token_sort_ratio",
     # Name cleanup + containment (commit B).
     "name_clean_full_ratio", "name_clean_core_ratio", "name_nospace_ratio", "name_nospace_partial_ratio",
@@ -101,29 +102,66 @@ def _one_edit_apart(x: str, y: str) -> bool:
 
 
 def house_number_relation(a: tuple, b: tuple) -> int:
-    """Compatibility of two addresses' house numbers (tuples from
-    normalize.house_numbers). Returns one of HN_* codes, checked in this order:
-    both empty / exactly one digit run shared / one run is a prefix or suffix
-    of another (min 2 digits: "6104" vs "104", "16549" vs "1654") / one edit
-    apart ("7800" vs "7802") / exactly one side has no number at all / no
+    """Compatibility of two addresses' house numbers (tuples of RAW digit
+    strings, leading zeros kept). Returns one of HN_* codes, checked in this
+    order: both empty / one number in common once leading zeros are ignored
+    ("03153" = "3153") / one number is the other with leading or trailing
+    digits dropped -- a prefix or suffix, min 2 digits, checked on the raw
+    strings so "302" vs "02" counts ("6104" vs "104", "16549" vs "1654") / one
+    edit apart ("7800" vs "7802") / exactly one side has no number at all / no
     number in common (conflict).
     """
     if not a and not b:
         return HN_BOTH_MISSING
     if not a or not b:
         return HN_ONE_MISSING
-    sa, sb = set(a), set(b)
-    if sa & sb:
+    if {x.lstrip("0") or "0" for x in a} & {y.lstrip("0") or "0" for y in b}:
         return HN_EQUAL
-    for x in sa:
-        for y in sb:
-            if min(len(x), len(y)) >= 2 and (x.startswith(y) or x.endswith(y) or y.startswith(x) or y.endswith(x)):
+    for x in a:
+        for y in b:
+            short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+            if len(short) >= 2 and (long_.startswith(short) or long_.endswith(short)):
                 return HN_PREFIX_SUFFIX
-    for x in sa:
-        for y in sb:
-            if _one_edit_apart(x, y):
+    for x in a:
+        for y in b:
+            if _one_edit_apart(x.lstrip("0"), y.lstrip("0")):
                 return HN_ONE_EDIT
     return HN_CONFLICT
+
+
+HN_SMALL_DIFF_MAX = 10
+
+
+def house_number_signals(a: tuple, b: tuple) -> tuple:
+    """All house-number pair signals in one pass.
+
+    Inputs: two tuples of (raw digits, suffix) from normalize.house_number_parts.
+    Output: (relation code, small_diff, min_abs_diff_log10, suffix_differs):
+      relation      house_number_relation on the digit strings;
+      small_diff    1.0 if two DIFFERENT numbers are within HN_SMALL_DIFF_MAX of
+                    each other (7800 vs 7802, 169 vs 171) -- neighbours on one
+                    street, or a slightly mistyped number;
+      min_abs_diff_log10  log10(1 + smallest |difference| over all number pairs),
+                    NaN if either side has no number;
+      suffix_differs  1.0 if the same number appears with two different
+                    suffixes ("12A" vs "12B", "12 bis" vs "12 ter"); a suffix on
+                    one side only is compatible.
+    """
+    rel = house_number_relation(tuple(d for d, _ in a), tuple(d for d, _ in b))
+    if not a or not b:
+        return rel, 0.0, np.nan, 0.0
+    min_diff = None
+    sfx_differs = 0.0
+    for x, sx in a:
+        vx = int(x[:12])
+        for y, sy in b:
+            d = abs(vx - int(y[:12]))
+            if min_diff is None or d < min_diff:
+                min_diff = d
+            if d == 0 and sx and sy and sx != sy:
+                sfx_differs = 1.0
+    small = 1.0 if any(0 < abs(int(x[:12]) - int(y[:12])) <= HN_SMALL_DIFF_MAX for x, _ in a for y, _ in b) else 0.0
+    return rel, small, float(np.log10(1 + min_diff)), sfx_differs
 
 
 def prepare_entities(s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
@@ -139,7 +177,7 @@ def prepare_entities(s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame
     prep = pd.DataFrame(index=pd.Index(both["entity_id"].values, name="entity_id"))
     prep["street"] = both["business_address"].map(normalize.street_key).values
     prep["hn"] = [
-        normalize.house_numbers(a, pc if isinstance(pc, str) else None)
+        normalize.house_number_parts(a, pc if isinstance(pc, str) else None)
         for a, pc in zip(both["business_address"], both["postal_code"])
     ]
 
@@ -309,7 +347,11 @@ def build_pair_features_base(
     p1 = prep.loc[pairs["s1_id"].values]
     p2 = prep.loc[pairs["cand_id"].values]
 
-    rel = np.fromiter((house_number_relation(a, b) for a, b in zip(p1["hn"], p2["hn"])), dtype=np.int8, count=n)
+    sig = [house_number_signals(a, b) for a, b in zip(p1["hn"], p2["hn"])]
+    rel = np.fromiter((s[0] for s in sig), dtype=np.int8, count=n)
+    out["hn_small_diff"] = np.fromiter((s[1] for s in sig), dtype=np.float32, count=n)
+    out["hn_min_abs_diff_log"] = np.fromiter((s[2] for s in sig), dtype=np.float32, count=n)
+    out["hn_suffix_differs"] = np.fromiter((s[3] for s in sig), dtype=np.float32, count=n)
     out["hn_equal"] = (rel == HN_EQUAL).astype(np.float32)
     out["hn_prefix_suffix"] = (rel == HN_PREFIX_SUFFIX).astype(np.float32)
     out["hn_one_edit"] = (rel == HN_ONE_EDIT).astype(np.float32)

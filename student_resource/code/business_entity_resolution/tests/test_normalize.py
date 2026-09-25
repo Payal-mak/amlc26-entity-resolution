@@ -169,3 +169,29 @@ class TestDigitLetterSwaps(unittest.TestCase):
 
     def test_clean_name_for_matching_combines_both(self):
         self.assertEqual(normalize.clean_name_for_matching("N0LLIE'S Salon (ID: 999)"), "NoLLIE'S Salon")
+
+
+class TestHouseNumberParts(unittest.TestCase):
+    parts = staticmethod(normalize.house_number_parts)
+
+    def test_unit_box_and_floor_numbers_are_not_house_numbers(self):
+        self.assertEqual(self.parts("3 Cross Timber, PMB 776, Edwards, Colorado"), (("3", ""),))
+        self.assertEqual(self.parts("Unit 6, 1213 Cross Creek Circle"), (("1213", ""),))
+        self.assertEqual(self.parts("1307 Kalahari Drive, Fl 3rd, Village"), (("1307", ""),))
+        self.assertEqual(self.parts("PO Box 3175, Jefferson City"), ())
+        self.assertEqual(self.parts("12 Main St, 4Th Floor"), (("12", ""),))
+
+    def test_letter_and_bis_ter_suffixes(self):
+        self.assertEqual(self.parts("12A Rue Victor Hugo"), (("12", "a"),))
+        self.assertEqual(self.parts("12 bis Rue Victor Hugo"), (("12", "b"),))
+        self.assertEqual(self.parts("12 ter Rue Victor Hugo"), (("12", "c"),))
+
+    def test_ordinal_is_not_a_suffix(self):
+        self.assertEqual(self.parts("1St Joint St, Chennai"), (("1", ""),))
+
+    def test_raw_digits_keep_leading_zeros(self):
+        self.assertEqual(self.parts("H.no 02, Bangalore"), (("02", ""),))
+        self.assertEqual(normalize.house_numbers("H.no 02, Bangalore"), ("2",))
+
+    def test_postal_code_dropped_once(self):
+        self.assertEqual(self.parts("7800 Valburn Drive, Austin 78701", "78701"), (("7800", ""),))
