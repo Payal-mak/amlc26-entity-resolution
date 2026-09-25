@@ -77,3 +77,29 @@ class TestBuildPairFeaturesBase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNameFeatures(unittest.TestCase):
+    def test_containment(self):
+        c = features._containment
+        self.assertEqual(c(frozenset({"quality", "biomedical"}), frozenset({"quality", "biomedical", "holdings"})), 1.0)
+        self.assertEqual(c(frozenset({"a", "b"}), frozenset({"a", "c", "d"})), 0.5)
+        self.assertEqual(c(frozenset(), frozenset({"a"})), 0.0)
+
+    def test_name_cleanup_features(self):
+        s1 = pd.DataFrame({
+            "entity_id": ["S1-1"], "business_name": ["Jarlus Pmv"], "business_address": ["131 Carroll Avenue, Mamaroneck, NY"],
+            "country": ["US"], "name_full": ["jarlus pmv"], "name_core": ["jarlus pmv"], "postal_code": [None],
+        })
+        cand = pd.DataFrame({
+            "entity_id": ["S2-1", "S2-2"], "business_name": ["jarluspmv.com", "Jarlus Pmv (ID: 28974)"],
+            "business_address": ["13 CARROLL AVE, MAMARONECK, NY"] * 2, "country": ["US", "US"],
+            "name_full": ["jarluspmv com", "jarlus pmv id 28974"], "name_core": ["jarluspmv com", "jarlus pmv id 28974"],
+            "postal_code": [None, None],
+        })
+        pairs = pd.DataFrame({"s1_id": ["S1-1", "S1-1"], "cand_id": ["S2-1", "S2-2"],
+                              "blocks": ["x", "x"], "n_blocks": [1, 1]})
+        out = features.build_pair_features_base(pairs, s1, cand)
+        self.assertEqual(out.loc[0, "name_nospace_ratio"], 100.0)   # "jarluspmv" vs "jarlus pmv" with spaces removed
+        self.assertEqual(out.loc[1, "name_clean_full_ratio"], 100.0)  # "(ID: 28974)" stripped
+        self.assertEqual(out.loc[1, "name_core_containment"], 1.0)

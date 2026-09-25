@@ -120,3 +120,52 @@ class TestAddressHelpers(unittest.TestCase):
 
     def test_house_numbers_none(self):
         self.assertEqual(normalize.house_numbers(None), ())
+
+
+class TestNameDecorations(unittest.TestCase):
+    strip = staticmethod(normalize.strip_name_decorations)
+
+    def test_id_in_parentheses(self):
+        self.assertEqual(self.strip("Global Harbor Rocket Llc (ID: 28974)"), "Global Harbor Rocket Llc")
+        self.assertEqual(self.strip("Cafe Du Monde (No. 12)"), "Cafe Du Monde")
+
+    def test_long_digit_run_after_dash(self):
+        self.assertEqual(self.strip("Gemous Worldwide Company - 1521888650"), "Gemous Worldwide Company")
+        self.assertEqual(self.strip("Peak Energy  Corporation - 4847674375"), "Peak Energy Corporation")
+
+    def test_short_digit_runs_are_kept(self):
+        self.assertEqual(self.strip("Studio 54"), "Studio 54")
+        self.assertEqual(self.strip("Route 66 Diner 12345"), "Route 66 Diner 12345")  # 5 digits: not a phone/account number
+
+    def test_domain_only_name_loses_its_ending(self):
+        self.assertEqual(self.strip("jarluspmv.com"), "jarluspmv")
+        self.assertEqual(self.strip("FOOTANKLEPARTNERS.COM"), "FOOTANKLEPARTNERS")
+        self.assertEqual(self.strip("-- maanursing.com"), "maanursing")
+        self.assertEqual(self.strip("bestservices.in"), "bestservices")  # no TLD list: keyed on the label.tld shape
+
+    def test_www_and_generic_tld_inside_a_longer_name(self):
+        self.assertEqual(self.strip("www.acme.in Ltd"), "acme.in Ltd")
+        self.assertEqual(self.strip("Acme.com Inc"), "Acme Inc")
+
+    def test_domain_shaped_token_in_a_longer_name_is_left_alone(self):
+        self.assertEqual(self.strip("St.Louis Hardware"), "St.Louis Hardware")
+
+    def test_none_and_empty(self):
+        self.assertEqual(self.strip(None), "")
+        self.assertEqual(self.strip(""), "")
+
+
+class TestDigitLetterSwaps(unittest.TestCase):
+    fix = staticmethod(normalize.fix_digit_letter_swaps)
+
+    def test_zero_and_one_between_letters(self):
+        self.assertEqual(self.fix("N0LLIE'S SECURE SALON"), "NoLLIE'S SECURE SALON")
+        self.assertEqual(self.fix("C1TY Bank"), "ClTY Bank")
+
+    def test_digits_at_word_edges_or_alone_are_untouched(self):
+        self.assertEqual(self.fix("Studio 54"), "Studio 54")
+        self.assertEqual(self.fix("A1 Auto 100"), "A1 Auto 100")
+        self.assertEqual(self.fix("3M Co"), "3M Co")
+
+    def test_clean_name_for_matching_combines_both(self):
+        self.assertEqual(normalize.clean_name_for_matching("N0LLIE'S Salon (ID: 999)"), "NoLLIE'S Salon")

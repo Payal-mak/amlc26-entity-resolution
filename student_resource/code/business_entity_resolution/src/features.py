@@ -52,6 +52,9 @@ FEATURE_COLUMNS = [
     # compatibility one-hots + street similarity with numbers removed.
     "hn_equal", "hn_prefix_suffix", "hn_one_edit", "hn_one_missing", "hn_conflict", "hn_both_missing",
     "street_ratio", "street_token_set_ratio", "street_token_sort_ratio",
+    # Name cleanup + containment (commit B).
+    "name_clean_full_ratio", "name_clean_core_ratio", "name_nospace_ratio", "name_nospace_partial_ratio",
+    "name_core_containment",
     "rank_by_s1", "gap_to_best_by_s1", "reverse_rank",
 ]
 
@@ -131,7 +134,45 @@ def prepare_entities(s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame
         normalize.house_numbers(a, pc if isinstance(pc, str) else None)
         for a, pc in zip(both["business_address"], both["postal_code"])
     ]
+
+    # Names with decorations stripped / digit-for-letter swaps fixed. Only
+    # names that actually change are re-normalized; everything else keeps the
+    # frame's existing name_full/name_core (which already include the
+    # Devanagari transliteration map, unavailable here).
+    raw = [n or "" for n in both["business_name"]]
+    cleaned = [normalize.clean_name_for_matching(n) for n in raw]
+    name_full = both["name_full"].tolist()
+    name_core = both["name_core"].tolist()
+    suffixes = _recover_suffix_set(name_full, name_core)
+    for i, (r, c) in enumerate(zip(raw, cleaned)):
+        if c != " ".join(r.split()):
+            name_full[i] = normalize.normalize_full(c)
+            name_core[i] = normalize.name_core(name_full[i], suffixes)
+    prep["name_full_c"] = name_full
+    prep["name_core_c"] = name_core
+    prep["name_nospace"] = [n.replace(" ", "") for n in name_full]
+    prep["core_tokens"] = [frozenset(n.split()) for n in name_core]
     return prep
+
+
+def _recover_suffix_set(name_full: list, name_core: list) -> set:
+    """The suffix/stop tokens name_core stripped, recovered from the data itself
+    (every token present in a name_full but absent from its name_core). The
+    per-country suffix sets aren't passed down to the feature builder, and a
+    country's frame contains every token that set ever removed."""
+    removed = set()
+    for f, c in zip(name_full, name_core):
+        if f != c:
+            removed.update(set(f.split()) - set(c.split()))
+    return removed
+
+
+def _containment(a: frozenset, b: frozenset) -> float:
+    """Share of the shorter token set found in the longer one (1.0 = one name's
+    core is entirely contained in the other's); 0.0 if either is empty."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
 
 
 def _pairwise(scorer, xs: list, ys: list) -> np.ndarray:
@@ -262,6 +303,16 @@ def build_pair_features_base(
         v = _pairwise(scorer, st1, st2)
         v[either_empty] = np.nan  # a blank/number-only address carries no street signal
         out[name] = v
+
+    nf1, nf2 = p1["name_full_c"].tolist(), p2["name_full_c"].tolist()
+    out["name_clean_full_ratio"] = _pairwise(fuzz.ratio, nf1, nf2)
+    out["name_clean_core_ratio"] = _pairwise(fuzz.ratio, p1["name_core_c"].tolist(), p2["name_core_c"].tolist())
+    ns1, ns2 = p1["name_nospace"].tolist(), p2["name_nospace"].tolist()
+    out["name_nospace_ratio"] = _pairwise(fuzz.ratio, ns1, ns2)
+    out["name_nospace_partial_ratio"] = _pairwise(fuzz.partial_ratio, ns1, ns2)
+    out["name_core_containment"] = np.fromiter(
+        (_containment(a, b) for a, b in zip(p1["core_tokens"], p2["core_tokens"])), dtype=np.float32, count=n
+    )
 
     result = pd.DataFrame(out)
     result["s1_id"] = pairs["s1_id"].values

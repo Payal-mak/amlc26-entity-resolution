@@ -151,6 +151,60 @@ def house_numbers(address: str, postal_code: str = None) -> tuple:
     return tuple(r.lstrip("0") or "0" for r in runs)
 
 
+# --- name decoration cleanup (used for pair-similarity features only) -------
+# Noise seen in real candidate names: "Global Harbor Rocket Llc (ID: 28974)",
+# "Gemous Worldwide Company - 1521888650", "jarluspmv.com", "www.x.com",
+# "N0LLIE'S SECURE SALON". Applied by src.features on top of the already
+# normalized columns, NOT inside normalize_full -- blocking (name_core keys)
+# is deliberately left exactly as it was. No country-specific lists: the
+# domain rule keys on the SHAPE "label.tld" of a single-token name, not on a
+# list of TLDs.
+_PAREN_CODE_RE = re.compile(r"\(\s*[^\W\d_]{0,4}\.?\s*[:#-]?\s*\d{2,}\s*\)")
+_LONG_DIGIT_TOKEN_RE = re.compile(r"(?:(?<=\s)|^)[-–—:#]*\s*\d{6,}(?=\s|$)")
+_WWW_RE = re.compile(r"\bwww\d?\.", re.IGNORECASE)
+_GENERIC_TLD_RE = re.compile(r"(?<=\w)\.(?:com|net|org|info|biz)\b", re.IGNORECASE)
+_SINGLE_DOMAIN_RE = re.compile(r"^[\W_]*([^\W_][\w-]*)(?:\.[^\W\d_]{2,6}){1,2}[\W_]*$")
+_DIGIT_IN_WORD_RE = re.compile(r"(?<=[^\W\d_])[01](?=[^\W\d_])")
+
+
+def strip_name_decorations(name: str) -> str:
+    """Remove "(ID: 123)"-style codes, standalone digit runs of 6+ digits
+    (phone/account numbers glued on with a dash), "www." and .com-style
+    endings from a raw business name. Input: raw name (or None). Output: the
+    same name without those decorations (unchanged text otherwise). A name
+    that is nothing but a domain ("jarluspmv.com") loses its ending; a
+    domain-shaped token inside a longer name is left alone, so "St.Louis
+    Hardware" is safe.
+    """
+    if not name:
+        return ""
+    out = _PAREN_CODE_RE.sub(" ", name)
+    out = _LONG_DIGIT_TOKEN_RE.sub(" ", out)
+    out = _WWW_RE.sub("", out)
+    out = _GENERIC_TLD_RE.sub("", out)
+    m = _SINGLE_DOMAIN_RE.match(out.strip())
+    if m:
+        out = m.group(1)
+    out = re.sub(r"\s+", " ", out).strip()
+    return re.sub(r"^[^\w(]+", "", out)  # leading junk like "-- " or "... "
+
+
+def fix_digit_letter_swaps(name: str) -> str:
+    """Inside a word, read a 0 as "o" and a 1 as "l" when letters sit on both
+    sides ("N0LLIE'S" -> "NoLLIE'S"). Digits at a word's edge or in an all-digit
+    token are untouched ("Studio 54", "3M", "A1").
+    """
+    if not name:
+        return ""
+    return _DIGIT_IN_WORD_RE.sub(lambda m: "o" if m.group(0) == "0" else "l", name)
+
+
+def clean_name_for_matching(name: str) -> str:
+    """strip_name_decorations, then fix_digit_letter_swaps. Output is still a
+    raw-style string: pass it to normalize_full to get name_full."""
+    return fix_digit_letter_swaps(strip_name_decorations(name))
+
+
 def normalize_full(text: str, translit_map: dict = None) -> str:
     """Transliterate (if needed) + basic_clean + abbreviation expansion.
 
