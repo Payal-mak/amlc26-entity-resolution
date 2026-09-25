@@ -34,6 +34,7 @@ on Kaggle:
 | `AML_LGBM_THREADS` | `--lgbm-threads` | `4` | `4` |
 | `AML_LGBM_MAX_BIN` | `--lgbm-max-bin` | `255` (LightGBM's own default) | `255` |
 | `AML_LGBM_TWO_ROUND` | `--lgbm-two-round` | `false` | `false` |
+| `AML_ENABLE_TFIDF_BLOCK` | `--disable-tfidf-block` | `true` | `true` (flip off if it's too slow/memory-heavy on the first real run -- never tested at full scale locally, see PROJECT_LOG.md) |
 
 `AML_WORK_DIR` holds intermediate artifacts (DuckDB database, parquet files) that are
 never committed (see `.gitignore`) and never need to survive between runs; on Kaggle,
@@ -155,12 +156,17 @@ python -m unittest discover -s tests -v
   statement.
 - `normalize.py` -- text normalization: `basic_clean`, `expand_abbreviations`,
   `normalize_full`, `name_core` (data-driven suffix stripping, not hardcoded --
-  see PROJECT_LOG.md for the France-with-zero-training-rows result), `has_devanagari`,
-  `transliterate_devanagari`. Unit tested (`tests/test_normalize.py`).
-- `blocking.py` -- candidate generation (5 blocks, each self-capped before union --
-  see module docstring for the OOM history that shaped this design).
+  see PROJECT_LOG.md for the France-with-zero-training-rows result), `has_devanagari`/
+  `transliterate_devanagari` (Devanagari only) and the generalized
+  `has_indic_script`/`transliterate_indic` (every Indic script the data contains --
+  recall-v2, see PROJECT_LOG.md). Unit tested (`tests/test_normalize.py`).
+- `blocking.py` -- candidate generation, 7 blocks (recall-v2 added B_address and
+  B_tfidf on top of the original 5), each self-capped before union -- see module
+  docstring for the OOM history that shaped this design. `BLOCK_NAMES` lists the
+  active set (`B_tfidf` is gated behind `AML_ENABLE_TFIDF_BLOCK`, default on).
   `block_and_cap_country` / `run_all_blocks` are the reusable per-country entry points
-  used by both the validation report and `scripts/run_pipeline.py`.
+  used by both the validation report and `scripts/run_pipeline.py`. Unit tested
+  (`tests/test_blocking_recall_v2.py` for the two new blocks).
 - `features.py` -- pairwise + context features (rapidfuzz string similarity, address
   digit-overlap, per-block flags, rank/reverse-rank). `build_country_features` is the
   memory-safe entry point real callers should use (streams in chunks, then a DuckDB

@@ -78,6 +78,17 @@ LGBM_NUM_THREADS = int(os.environ.get("AML_LGBM_THREADS", "4"))
 LGBM_MAX_BIN = int(os.environ.get("AML_LGBM_MAX_BIN", "255"))
 LGBM_TWO_ROUND = os.environ.get("AML_LGBM_TWO_ROUND", "false").strip().lower() in ("1", "true", "yes")
 
+# recall-v2 (2026-09-25): src/blocking.py's char-3-gram TF-IDF block
+# (block_b_tfidf_char_ngram) measured very strong standalone recall on a
+# local SUBSET test (77% India / 94% US -- see PROJECT_LOG.md), but its real
+# full-country-scale cost (a sparse matmul, not an indexed SQL join like
+# every other block) was deliberately never run locally on this 8GB machine
+# per explicit instruction -- the first real Kaggle run is the first time it
+# runs at full scale. This flag exists so it can be turned off with no code
+# change (AML_ENABLE_TFIDF_BLOCK=false) if it turns out too slow/memory-heavy
+# there, without losing the rest of the recall-v2 blocking changes.
+ENABLE_TFIDF_BLOCK = os.environ.get("AML_ENABLE_TFIDF_BLOCK", "true").strip().lower() in ("1", "true", "yes")
+
 # Entity id prefixes / column names, used instead of literals across modules.
 SOURCE1_PREFIX = "S1-"
 SOURCE2_PREFIX = "S2-"

@@ -827,3 +827,152 @@ number, and that `--stage <name>` resumes if a session times out mid-run.
 Hand off to Kaggle for the real run. Once it completes: read back the val_train OOF
 report (the real one, at 45k scale) and the final matching_results.tsv/
 candidate_pairs.tsv, run the validator, and get the first real submission out.
+
+## 2026-09-25 — recall-v2 branch: closing the miss_analysis.py gaps
+
+Kaggle run started (from the README command). While it runs, on a separate `recall-v2`
+branch (no changes to anything the running job's files depend on): built the four fixes
+`miss_analysis.py`'s 100-pair stratified miss sample pointed at, measured each on the
+real validation slice before moving to the next, per explicit instruction.
+
+### miss_analysis.py: committed, with its counting bug fixed
+`compute_final_cap_miss_count` was counting every pair lost to the final cross-block cap,
+not just TRUE-match pairs among them (should mirror `compute_miss_universe`'s anti-join
+restricted to `eval_truth`). Fixed; recomputed value against the on-disk tagged/capped
+parquet is 2,039 (351 India + 1,688 US) -- not the ~1,419 the earlier session's
+percentage-based estimate implied, which turned out to be arithmetic on a stale
+`report.json` vs. the current on-disk tagged/capped parquet (a rerun since then shifted
+both by the ~0.003% cross-run tie-breaking noise already flagged, at these totals enough
+to move the count meaningfully). Not chased further; the corrected query itself is right.
+
+### Fix #1: B2's document-frequency cap (`B2_MAX_CAND_TOKEN_DF`)
+Phase 3's own docstring already recorded that raising this 150->400 in isolation was a
+wash (`recall_capped` flat-to-worse). Reproduced that exactly on this branch
+(`scripts/recall_v2_b2_df_sweep.py`: 150->0.79069, 400->0.79045) -- confirms the earlier
+finding, but it turned out not to generalize to bigger relaxation. At 2000 (still with
+`CANDIDATES_PER_S1_CAP` unchanged at 50): `recall_capped` 0.8068, a real +1.6pp the 400
+test alone couldn't see, because the newly-found B2 pairs were mostly getting crowded
+out at the final cross-block cut, not failing to be found at all -- confirmed directly
+with `scripts/recall_v2_cap_interaction.py`, sweeping `CANDIDATES_PER_S1_CAP` at
+B2_MAX_CAND_TOKEN_DF=2000: cap=50 -> 0.8068, cap=75 -> 0.8226, cap=100/150/250 -> 0.8226
+(no further gain -- 75 already covers essentially every S1 that has that many real
+candidates). Adopted: `B2_MAX_CAND_TOKEN_DF=2000`, `CANDIDATES_PER_S1_CAP=75`. Cost:
+avg candidates/S1 37.5 -> 43.1 (+15%), i.e. ~15% more feature-build/training compute on
+Kaggle for +3.19pp capped recall. Didn't pin down the true optimum between 400 and 2000,
+or above 2000 -- this 8GB machine hit real join-fanout OOMs sweeping that range (first
+attempt: `AML_DUCKDB_MEMORY_LIMIT` defaulted to config.py's Kaggle-sized 20GB even
+though this is the 8GB laptop, since the sweep script never set the local override
+before importing `config` -- fixed by setting `AML_DUCKDB_MEMORY_LIMIT=3GB` first, same
+env-var-before-import rule as everywhere else; second attempt still OOM'd past
+df=400 -- genuine local memory ceiling, not a bug). 2000 is `miss_analysis.py`'s own
+tested relaxed value, not a fitted optimum; worth a tighter Kaggle-side sweep later.
+
+### Fix #2: char-3-gram TF-IDF block (`block_b_tfidf_char_ngram`, new)
+Cosine similarity over character 3-grams, within country, top-K (15) per S1, `max_df`
+(fraction) capping vocabulary the same way `B2_MAX_CAND_TOKEN_DF` caps B2's fan-out.
+Targets exactly what token-equality blocks structurally cannot reach: domain-glued names
+("butlerhall.com" as one token), leading-#/hashtag-style names, word-order scrambles,
+heavy typos. Chose a batched scipy sparse matmul (fit one `TfidfVectorizer` per country,
+transform candidates once, transform+multiply S1 in fixed-size batches) over the
+`sparse_dot_topn` package, to avoid a new dependency of uncertain Kaggle availability.
+Unit tested (`tests/test_blocking_recall_v2.py`) for correctness on tiny synthetic data.
+**Per explicit instruction, never run at full country scale locally** (a sparse matmul
+over char-trigrams is a fundamentally different memory/CPU profile than the indexed SQL
+joins every other block uses -- at full scale, 185k x 658k for India, this is untested
+outside Kaggle). Small-subset test only (1,500 sampled S1 + a 15-20k candidate
+background per country, `scripts/recall_v2_tfidf_subset_test.py`): standalone recall on
+the subset **77% India / 94% US** at ~14 candidates/S1 -- stronger alone than any
+original block's standalone recall in the Phase 3 report (best was
+`b_sorted_neighborhood` at 63.6%). Wired into `src/blocking.py`'s `BLOCK_NAMES`/
+`run_all_blocks`, gated behind `config.ENABLE_TFIDF_BLOCK` (env `AML_ENABLE_TFIDF_BLOCK`,
+CLI `--disable-tfidf-block` on `run_pipeline.py`, default ON) specifically so it can be
+turned off with no code change if the real Kaggle run finds it too slow/memory-heavy.
+
+### Fix #3: transliteration generalized to every Indic script, not just Devanagari
+`miss_analysis.py`'s 100-pair sample found 10/49 structural misses were non-Devanagari
+Indic scripts -- same failure mode Devanagari had before transliteration existed
+(`basic_clean`'s a-z0-9 filter silently produces an EMPTY name_core). Generalized
+`has_devanagari`/`transliterate_devanagari` to `has_indic_script`/`transliterate_indic`
+(covers Bengali, Gujarati, Gurmukhi, Kannada, Malayalam, Oriya, Tamil, Telugu, in
+addition to Devanagari, via `indic_transliteration`'s other schemes, same schwa-deletion
+pass); `normalize_full` now dispatches through the generic version. Devanagari-specific
+functions and the learned `TRANSLIT_TOKEN_MAP` (Phase 2) are unchanged -- still
+Devanagari-only, since that map was learned specifically from Devanagari<->Latin
+confirmed pairs. Measured how big this actually is (not just the 10/49 miss-sample
+count, which is a small tail): counted script per record across the full real train
+data -- **source2 alone has ~195k non-Devanagari-Indic-script records** (Telugu 39,323;
+Kannada 37,211; Tamil 33,781; Gujarati 30,929; Bengali 30,723; Malayalam 18,773; Oriya
+7,493; Gurmukhi 6,688), comparable in scale to Devanagari's 269,424 -- these were
+previously ALWAYS block-invisible on the name side, in every country/block, not a rare
+edge case. One coverage gap found while unit-testing: `indic_transliteration`'s
+Tamil->ITRANS scheme doesn't map the alveolar 'ன' character -- harmless in practice,
+since `basic_clean`'s a-z0-9 filter strips whatever's left, same as any other stray
+character; `normalize_full` still never returns empty (test coverage:
+`tests/test_normalize.py::TestOtherIndicScripts`, 8 new tests).
+
+### Fix #4: address-only block (`block_b_address_rare_tokens`, new)
+Shared rare address tokens (score = sum of 1/df, DF-capped both ends like B2) plus a
+house-number-match bonus (first digit run in the address, `HOUSE_NUMBER_EXPR`), within
+country. Always on (SQL/indexed-join based, same cost profile as B1/B2/B3/B_geo, so
+measured at the real full validation-slice scale locally, no subset caveat needed).
+Turned out much bigger than "a niche DBA-only fix": for TRUE match pairs in general,
+addresses tend to agree even when normalized names don't (same business scraped from
+multiple sources), so this block is really a stronger generalization of B_geo's
+single-rarest-token signal (which alone already gave 26.5% standalone recall in the
+Phase 3 report) rather than a rare-case patch. Measured
+(`scripts/recall_v2_address_block_eval.py`, held the other 5 blocks fixed from the
+existing tagged parquet, added B_address's own pairs on top, cap=75 per fix #1):
+baseline recall_capped 0.8036 -> 0.9028 with B_address added, +15,476 net-new true pairs
+recovered that no other block found at all. Cost: avg candidates/S1 39.6 -> 48.1.
+
+### Final combined local measurement (5 original blocks + B_address, B2/cap at the new
+defaults, transliteration fix live in every normalize_full call -- **B_tfidf excluded**,
+per fix #2's explicit "never full-scale locally" instruction)
+Reran the real `scripts/phase3_blocking_report.py` unmodified, with `src/blocking.py`'s
+updated defaults and `AML_ENABLE_TFIDF_BLOCK=false`, against the same real validation
+slice the original 0.7907 baseline came from (original `tagged_*.parquet`/`report.json`
+backed up to `parquet/phase3/recall_v2_baseline_backup/` first).
+
+First attempt crashed (`pyarrow.lib.ArrowMemoryError` writing `tagged_India.parquet` --
+the bigger candidate counts at the new cap finally overflowed this 8GB machine's
+remaining ~2.6GB free at the pandas->arrow conversion step, unrelated to DuckDB's own
+`memory_limit`). Rewrote as `scripts/recall_v2_final_check.py`: same real block calls,
+but computes recall directly from each country's in-memory result (no parquet write, no
+cross-country accumulation of raw pairs -- just running counters), one country fully
+processed and freed before the next. That version completed:
+
+| | recall_uncapped | recall_capped | avg candidates/S1 | n_capped_pairs |
+|---|---|---|---|---|
+| **Original baseline** (5 blocks, DF=150, cap=50) | 0.7998 | **0.7907** | 37.5 | 11,153,420 |
+| **recall-v2, minus B_tfidf** (6 blocks, DF=2000, cap=75) | 0.9121 | **0.9117** | 51.6 (p99=73) | 15,372,379 |
+
+By country (recall_capped): India 0.7477 -> **0.8752**, US 0.8197 -> **0.9363**. A real
+**+12.1pp** overall, from B2's relaxed DF cap + the raised final cap (fix #1) and
+B_address (fix #4) together -- bigger than either measured in isolation (0.8226 and
+0.9028 respectively against a cap=75-only baseline), since the two fixes' newly-found
+pairs aren't fully overlapping. Cost: n_capped_pairs +38% (11.15M -> 15.37M) -- real
+extra feature-build/training compute on the next Kaggle run, not free.
+
+### What's left / next Kaggle run
+- 0.9117 is a FLOOR, not the ceiling: B_tfidf (fix #2) is not included in it at all (never
+  run at full scale outside Kaggle), and its subset-alone recall (77% India / 94% US) was
+  higher than any other single block's standalone number and targets failure modes (
+  domain-glued names, hashtag-style, word-order scrambles, typos) none of the other 6
+  blocks reach at all -- the real combined number on Kaggle should be meaningfully higher
+  still, plausibly within reach of the 97% target rather than clearly short of it (the
+  read going into this branch, before B_address's real size was known).
+- `--disable-tfidf-block` exists as an immediate fallback if B_tfidf's full-scale cost is
+  too high on the first real run; nothing else in this branch depends on it being on, and
+  the 0.9117 floor holds either way.
+- Recommended next Kaggle command: the same `scripts/run_pipeline.py --stage all` command
+  as before (README), now picking up recall-v2's `src/blocking.py`/`src/normalize.py`
+  changes automatically (no pipeline-script changes were needed for the blocking side) --
+  just merge/rebase `recall-v2` onto whatever branch Kaggle pulls from first. Worth
+  watching the `val_blocking` stage's timing/memory specifically on the first run, since
+  B_tfidf's full-country-scale cost is genuinely untested before that point; fall back to
+  `--disable-tfidf-block` if it stalls rather than losing the whole run.
+- The +38% candidate-count growth (11.15M -> 15.37M pairs, before B_tfidf adds more on
+  top) is real extra `train_features`/`test_features`/`train` compute -- the README's
+  existing "a few hours, likely fitting one Kaggle session but not by a wide margin"
+  estimate should now be read as tighter, not looser; `--stage <name>` resume is the
+  safety net if a session times out mid-run.

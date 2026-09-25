@@ -100,6 +100,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lgbm-threads", default=None, type=int, help="LightGBM n_jobs (4 default). Env: AML_LGBM_THREADS")
     p.add_argument("--lgbm-max-bin", default=None, type=int, help="LightGBM max_bin (255 default -- the library's own default). Env: AML_LGBM_MAX_BIN")
     p.add_argument("--lgbm-two-round", action="store_true", help="Force LightGBM two_round=True (off by default; a laptop-memory compromise, not needed on Kaggle). Env: AML_LGBM_TWO_ROUND")
+    p.add_argument("--disable-tfidf-block", action="store_true", help="Turn off src.blocking's char-3-gram TF-IDF block (on by default -- recall-v2). Its full-country-scale cost was never run locally (sparse matmul, not an indexed SQL join); use this if it's too slow/memory-heavy on the first Kaggle run. Env: AML_ENABLE_TFIDF_BLOCK")
     p.add_argument("--val-target-total", default=45000, type=int, help="Validation-slice size (scripts/build_validation_split.py). Use a small value (e.g. 2000) for a local smoke test.")
     p.add_argument(
         "--stage", default="all",
@@ -134,6 +135,8 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ["AML_LGBM_MAX_BIN"] = str(args.lgbm_max_bin)
     if args.lgbm_two_round:
         os.environ["AML_LGBM_TWO_ROUND"] = "true"
+    if args.disable_tfidf_block:
+        os.environ["AML_ENABLE_TFIDF_BLOCK"] = "false"
 
 
 _args = _parse_args()
