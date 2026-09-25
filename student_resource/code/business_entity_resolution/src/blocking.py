@@ -48,9 +48,11 @@ primary control.
 import re
 
 import duckdb
+import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-from . import normalize
+from . import config, normalize
 
 POSTAL_EXPR = """
 COALESCE(
@@ -58,6 +60,13 @@ COALESCE(
     NULLIF(regexp_extract(business_address, '(\\d{5})(?:-\\d{4})?\\D*$', 1), '')
 )
 """
+
+# recall-v2 fix #4 (address-only block): the FIRST digit run anywhere in the
+# address, as a cheap proxy for a street/house number -- free-text addresses
+# don't have a reliable structured "house number" field, but the leading
+# digit group is usually it ("221B Baker Street" -> "221"). NULLIF on ''
+# so a no-digit address gets NULL, not an empty-string false match.
+HOUSE_NUMBER_EXPR = "NULLIF(regexp_extract(business_address, '(\\d+)', 1), '')"
 
 # Python-side equivalent of POSTAL_EXPR above (same two regexes -- 6-digit
 # India PIN, then 5(+4) US ZIP -- kept identical on purpose so a pandas-side
@@ -79,21 +88,82 @@ def extract_postal(address) -> str:
     m = _POSTAL_RE_5.search(address)
     return m.group(1) if m else None
 
+
+_HOUSE_NUMBER_RE = re.compile(r"(\d+)")
+
+
+def extract_house_number(address) -> str:
+    """Python-side equivalent of HOUSE_NUMBER_EXPR (the first digit run
+    anywhere in the address). Inputs/Output: same contract as extract_postal.
+    """
+    address = address or ""
+    m = _HOUSE_NUMBER_RE.search(address)
+    return m.group(1) if m else None
+
 MIN_TOKEN_LEN = 3
 MIN_GEO_TOKEN_DF = 3
-CANDIDATES_PER_S1_CAP = 50
+# recall-v2 (2026-09-25): raised from 50. miss_analysis.py's 100-pair
+# stratified miss sample found most misses were found by SOME block before
+# the per-block cap but then lost at exactly this final cross-block cut
+# (crowded out by other S1s' more-numerous candidates). Measured on the real
+# validation slice (scripts/recall_v2_cap_interaction.py) at
+# B2_MAX_CAND_TOKEN_DF=2000: cap=50 -> recall_capped 0.8068, cap=75 -> 0.8226,
+# cap=100/150/250 -> 0.8226 (no further gain -- 75 already accommodates
+# essentially every S1 that has that many real candidates at all). 75 is the
+# point past which extra candidates cost feature-build/training compute on
+# Kaggle for zero measured recall.
+CANDIDATES_PER_S1_CAP = 75
 PER_BLOCK_CAP = 20
 # A token shared by more than this many candidate-side records (within
-# country) is excluded from B2 entirely -- the Phase 3 diagnostic distribution
-# had p99=114, so 150 keeps ~99% of real tokens while cutting off the
-# unbounded-fan-out tail that caused an OOM (spilled to 43.7GB) the first time
-# this block had no cap at all. Tried raising to 400 (hypothesis: excluding
-# common-but-useful shared words like "vijay"+"ventures"/"bright"/"golden" was
-# costing real recall) -- measured effect was negligible (uncapped recall
-# +0.38pp, capped recall flat-to-worse: 0.7907->0.7905), so reverted to 150,
-# which is also cheaper. See PROJECT_LOG.md, Phase 3.
-B2_MAX_CAND_TOKEN_DF = 150
+# country) is excluded from B2 entirely -- caps the unbounded-fan-out tail
+# that caused an OOM (spilled to 43.7GB) the first time this block had no cap
+# at all.
+# recall-v2 (2026-09-25): raised from 150 to 2000. Earlier (Phase 3) this was
+# tried at 400 in isolation and reverted -- true at 400, but that measurement
+# didn't go far enough: recall_capped is genuinely FLAT from 150->400 (an
+# effect real enough to reproduce again on this branch:
+# scripts/recall_v2_b2_df_sweep.py, recall_capped 0.79069->0.79045), but NOT
+# flat all the way to 2000. At 2000 (still with CANDIDATES_PER_S1_CAP=50, i.e.
+# nothing else changed), recall_capped measured 0.8068 vs the 150 baseline's
+# 0.7907 -- a real +1.6pp gain the 400 test alone couldn't see. Combined with
+# raising CANDIDATES_PER_S1_CAP to 75 above: 0.8226, +3.19pp over baseline.
+# The candidate-count cost: avg candidates/S1 37.5 -> 43.1 (+15%). Values
+# between 400 and 2000, and above 2000, weren't pinned down further -- this
+# machine's 8GB RAM hit real join-fanout memory/spill limits sweeping that
+# range (see PROJECT_LOG.md); 2000 is miss_analysis.py's own tested relaxed
+# value, not a fitted optimum. Re-sweep on Kaggle if a tighter number matters.
+B2_MAX_CAND_TOKEN_DF = 2000
 SORTED_NEIGHBOR_WINDOW = 10
+
+# B_tfidf (recall-v2, miss_analysis.py fix #2): char-3-gram TF-IDF top-K,
+# within country -- targets exactly the miss categories token-equality
+# blocks (B1/B2) structurally can't reach: domain-glued names
+# ("butlerhall.com" as one token), leading-#/hashtag-style names, word-order
+# scrambles, and heavy typos, since cosine-over-character-3-grams doesn't
+# care about token boundaries or token order at all.
+# max_df as a FRACTION (not a count, unlike B2_MAX_CAND_TOKEN_DF) drops
+# trigrams shared by more than this fraction of the country's candidates
+# from the vocabulary entirely -- the same "cap the fan-out source, not the
+# join result" principle as B2_MAX_CAND_TOKEN_DF, applied to a promiscuous
+# trigram like "ltd"/"inc"/"com" that would otherwise make nearly every
+# batch x candidate similarity dense.
+TFIDF_NGRAM_RANGE = (3, 3)
+TFIDF_MAX_TOKEN_DF_FRACTION = 0.3
+TFIDF_TOP_K = 15
+TFIDF_MIN_SIMILARITY = 0.3
+TFIDF_S1_BATCH_SIZE = 2000
+
+# B_address (recall-v2 fix #4): rare shared address tokens + a house-number
+# match, within country -- targets DBA / rename cases where the NAME is
+# unrelated but the address is the same physical location, which no
+# name-based block (B1/B2/B_tfidf) can ever reach by construction.
+# Same two-sided DF cap idea as B2: MIN excludes single-occurrence noise
+# tokens (a typo/OCR artifact shared by nobody else means nothing), MAX
+# excludes address tokens so common (city/state names) they carry no signal
+# and would otherwise dominate the fan-out.
+ADDRESS_MIN_TOKEN_DF = 3
+ADDRESS_MAX_TOKEN_DF = 500
+ADDRESS_HOUSE_NUMBER_BONUS = 2.0
 
 
 def add_normalized_columns(df: pd.DataFrame, suffix_sets: dict, translit_map: dict = None) -> pd.DataFrame:
@@ -167,6 +237,85 @@ def register_geo_tokens(con: duckdb.DuckDBPyConnection, view: str, out_view: str
         QUALIFY ROW_NUMBER() OVER (PARTITION BY t.entity_id ORDER BY d.df ASC, t.token ASC) = 1
         """
     )
+
+
+def register_house_number(con: duckdb.DuckDBPyConnection, view: str, out_view: str) -> None:
+    """Add a house_number column (regex-extracted, see HOUSE_NUMBER_EXPR) to
+    `view`, registered as `out_view`.
+    """
+    con.execute(f"CREATE OR REPLACE TABLE {out_view} AS SELECT *, {HOUSE_NUMBER_EXPR} AS house_number FROM {view}")
+
+
+def register_address_tokens(con: duckdb.DuckDBPyConnection, view: str, out_view: str) -> None:
+    """Explode business_address into (entity_id, country, token), same
+    tokenization register_geo_tokens uses internally (lowercase, non-
+    alnum -> space, length-filtered, purely-numeric tokens dropped since
+    those are handled separately by house_number/postal_code). Used by
+    block_b_address_rare_tokens.
+    """
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {out_view} AS
+        SELECT entity_id, country, token
+        FROM (
+            SELECT entity_id, country,
+                   UNNEST(regexp_split_to_array(
+                       regexp_replace(lower(business_address), '[^a-z0-9]+', ' ', 'g'), ' '
+                   )) AS token
+            FROM {view}
+        )
+        WHERE length(token) >= {MIN_TOKEN_LEN} AND NOT regexp_matches(token, '^[0-9]+$')
+        """
+    )
+
+
+def block_b_address_rare_tokens(
+    con: duckdb.DuckDBPyConnection,
+    s1_view: str,
+    cand_view: str,
+    s1_addr_tok_view: str,
+    cand_addr_tok_view: str,
+) -> str:
+    """B_address: shared rare address tokens (score = sum of 1/df, DF-capped
+    both ends like B2) plus a house-number-match bonus, within country --
+    for DBA / renamed-business cases where the NAME is unrelated but the
+    physical address is the same, which no name-based block can ever reach.
+    `s1_view`/`cand_view` must already have house_number registered (see
+    register_house_number). Capped at PER_BLOCK_CAP per S1, like every other
+    block. Returns the output table name.
+    """
+    out = "baddr_pairs"
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE addr_cand_token_df AS
+        SELECT country, token, COUNT(*) AS df FROM {cand_addr_tok_view} GROUP BY country, token
+        """
+    )
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {out} AS
+        SELECT s1_id, cand_id FROM (
+            SELECT s1_id, cand_id,
+                   ROW_NUMBER() OVER (PARTITION BY s1_id ORDER BY score DESC, cand_id) AS rn
+            FROM (
+                SELECT s.entity_id AS s1_id, c.entity_id AS cand_id,
+                       SUM(1.0 / d.df)
+                       + MAX(CASE WHEN s.house_number IS NOT NULL AND s.house_number = c.house_number
+                                  THEN {ADDRESS_HOUSE_NUMBER_BONUS} ELSE 0 END) AS score
+                FROM {s1_view} s
+                JOIN {s1_addr_tok_view} st ON st.entity_id = s.entity_id
+                JOIN addr_cand_token_df d
+                  ON d.country = st.country AND d.token = st.token
+                 AND d.df BETWEEN {ADDRESS_MIN_TOKEN_DF} AND {ADDRESS_MAX_TOKEN_DF}
+                JOIN {cand_addr_tok_view} ct ON ct.country = st.country AND ct.token = st.token
+                JOIN {cand_view} c ON c.entity_id = ct.entity_id AND c.country = s.country
+                GROUP BY s.entity_id, c.entity_id
+            )
+        )
+        WHERE rn <= {PER_BLOCK_CAP}
+        """
+    )
+    return out
 
 
 def register_name_tokens(con: duckdb.DuckDBPyConnection, view: str, out_view: str) -> None:
@@ -351,10 +500,21 @@ def block_b_sorted_neighborhood(
     return out
 
 
-def block_b_geo(con: duckdb.DuckDBPyConnection, s1_geo_view: str, cand_geo_view: str) -> str:
+def block_b_geo(
+    con: duckdb.DuckDBPyConnection, s1_geo_view: str, cand_geo_view: str, max_cand_token_df: int = config.GEO_MAX_CAND_TOKEN_DF
+) -> str:
     """B_geo: shared rarest in-country address token, capped at PER_BLOCK_CAP
     per S1 (score = 1/geo_df, so a shared rare locality token ranks above a
     shared common one). Returns the output table name.
+
+    max_cand_token_df (recall-v2, added after a real Kaggle full-train-scale
+    OOM -- see config.GEO_MAX_CAND_TOKEN_DF's docstring): excludes candidates
+    whose OWN chosen geo_token has candidate-side document frequency above
+    this, from the JOIN condition itself -- same principle as B2's
+    B2_MAX_CAND_TOKEN_DF, and for the same reason: the expensive part is the
+    join's fan-out on a too-common token, which happens before the
+    `rn <= PER_BLOCK_CAP` cut below could ever discard the excess rows, so
+    that cut alone doesn't bound the actual work done.
     """
     out = "bgeo_pairs"
     con.execute(
@@ -364,11 +524,98 @@ def block_b_geo(con: duckdb.DuckDBPyConnection, s1_geo_view: str, cand_geo_view:
             SELECT s.entity_id AS s1_id, c.entity_id AS cand_id,
                    ROW_NUMBER() OVER (PARTITION BY s.entity_id ORDER BY (1.0 / c.geo_df) DESC, c.entity_id) AS rn
             FROM {s1_geo_view} s JOIN {cand_geo_view} c
-              ON s.country = c.country AND s.geo_token = c.geo_token
+              ON s.country = c.country AND s.geo_token = c.geo_token AND c.geo_df <= {max_cand_token_df}
         )
         WHERE rn <= {PER_BLOCK_CAP}
         """
     )
+    return out
+
+
+def block_b_tfidf_char_ngram(
+    con: duckdb.DuckDBPyConnection,
+    s1_view: str,
+    cand_view: str,
+    text_col: str = "name_core",
+    top_k: int = TFIDF_TOP_K,
+    min_similarity: float = TFIDF_MIN_SIMILARITY,
+    batch_size: int = TFIDF_S1_BATCH_SIZE,
+    max_df: float = TFIDF_MAX_TOKEN_DF_FRACTION,
+) -> str:
+    """B_tfidf: char-3-gram TF-IDF cosine similarity top-K per S1, within
+    country. Catches matches no token-equality block can: domain-glued names
+    ("butlerhall.com"), leading-#/hashtag-style names, word-order scrambles,
+    heavy typos -- see module note above TFIDF_NGRAM_RANGE.
+
+    Chose a batched scipy sparse matmul over the sparse_dot_topn package
+    (would need a new dependency, uncertain availability on Kaggle) -- fit
+    ONE TfidfVectorizer per country (S1+candidates combined, so cosine
+    similarity is meaningful), transform the candidate side once, then
+    transform+multiply S1 in `batch_size`-row chunks so the
+    (batch_size x n_candidates) similarity matrix is bounded regardless of
+    how large the country's candidate pool is. `TFIDF_MAX_TOKEN_DF_FRACTION`
+    (vectorizer's max_df) keeps that matrix from densifying on common
+    trigrams, the same role B2_MAX_CAND_TOKEN_DF plays for B2.
+
+    Inputs: connection; S1/candidate view names (need entity_id + text_col);
+    text_col to vectorize (name_core, i.e. already suffix-stripped); top_k,
+    min_similarity, batch_size, max_df (all overridable for sweeps/tests --
+    max_df in particular needs relaxing on a tiny synthetic corpus, where
+    "shared by >30% of documents" excludes almost every trigram).
+    Output: output table name (s1_id, cand_id) -- NOT yet capped at
+    PER_BLOCK_CAP like the SQL blocks (top_k already bounds it; callers that
+    want exactly PER_BLOCK_CAP semantics should pass top_k=PER_BLOCK_CAP).
+    Registers nothing if either side is empty.
+    """
+    s1_df = con.execute(f"SELECT entity_id, {text_col} FROM {s1_view}").fetchdf()
+    cand_df = con.execute(f"SELECT entity_id, {text_col} FROM {cand_view}").fetchdf()
+    out = "btfidf_pairs"
+    if s1_df.empty or cand_df.empty:
+        con.execute(f"CREATE OR REPLACE TABLE {out} (s1_id VARCHAR, cand_id VARCHAR)")
+        return out
+
+    s1_texts = s1_df[text_col].fillna("")
+    cand_texts = cand_df[text_col].fillna("")
+    vectorizer = TfidfVectorizer(
+        analyzer="char", ngram_range=TFIDF_NGRAM_RANGE, max_df=max_df, min_df=1,
+    )
+    vectorizer.fit(pd.concat([s1_texts, cand_texts], ignore_index=True))
+    cand_matrix = vectorizer.transform(cand_texts).tocsr()
+    cand_ids = cand_df["entity_id"].to_numpy()
+    s1_ids = s1_df["entity_id"].to_numpy()
+
+    out_s1, out_cand, out_score = [], [], []
+    for start in range(0, len(s1_df), batch_size):
+        end = start + batch_size
+        batch_matrix = vectorizer.transform(s1_texts.iloc[start:end]).tocsr()
+        sims = (batch_matrix @ cand_matrix.T).tocsr()
+        for local_i in range(sims.shape[0]):
+            row_start, row_end = sims.indptr[local_i], sims.indptr[local_i + 1]
+            if row_start == row_end:
+                continue
+            data = sims.data[row_start:row_end]
+            cols = sims.indices[row_start:row_end]
+            if len(data) > top_k:
+                keep = np.argpartition(-data, top_k - 1)[:top_k]
+                data, cols = data[keep], cols[keep]
+            keep_mask = data >= min_similarity
+            for score, col in zip(data[keep_mask], cols[keep_mask]):
+                out_s1.append(s1_ids[start + local_i])
+                out_cand.append(cand_ids[col])
+                out_score.append(float(score))
+
+    pairs_df = pd.DataFrame({"s1_id": out_s1, "cand_id": out_cand, "score": out_score})
+    con.register("btfidf_tmp", pairs_df)
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {out} AS
+        SELECT s1_id, cand_id FROM (
+            SELECT s1_id, cand_id, ROW_NUMBER() OVER (PARTITION BY s1_id ORDER BY score DESC, cand_id) AS rn
+            FROM btfidf_tmp
+        ) WHERE rn <= {top_k}
+        """
+    )
+    con.unregister("btfidf_tmp")
     return out
 
 
@@ -421,7 +668,15 @@ def cap_candidates(con: duckdb.DuckDBPyConnection, scored_view: str, cap: int = 
     return out
 
 
-BLOCK_NAMES = ["b1_exact_core", "b2_rare_token", "b3_postal_minor", "b_sorted_neighborhood", "bgeo_address_token"]
+# recall-v2 (2026-09-25): added b_address_rare_tokens (always on -- cheap,
+# indexed SQL join like every original block) and b_tfidf_char_ngram (gated
+# behind config.ENABLE_TFIDF_BLOCK -- see its docstring for why). BLOCK_NAMES
+# is read once at import time, same as every other AML_*-driven setting, so
+# set AML_ENABLE_TFIDF_BLOCK before any `src` import if it needs to differ
+# from the default.
+BLOCK_NAMES = ["b1_exact_core", "b2_rare_token", "b3_postal_minor", "b_sorted_neighborhood", "bgeo_address_token", "b_address_rare_tokens"]
+if config.ENABLE_TFIDF_BLOCK:
+    BLOCK_NAMES = BLOCK_NAMES + ["b_tfidf_char_ngram"]
 
 
 def register_suffix_table(con: duckdb.DuckDBPyConnection, suffix_sets: dict) -> None:
@@ -456,13 +711,21 @@ def run_all_blocks(con: duckdb.DuckDBPyConnection, s1_country: pd.DataFrame, can
     register_geo_tokens(con, "cand_norm", "cand_geo")
     register_name_tokens(con, "s1_norm", "s1_tok")
     register_name_tokens(con, "cand_norm", "cand_tok")
+    register_house_number(con, "s1_norm", "s1_house")
+    register_house_number(con, "cand_norm", "cand_house")
+    register_address_tokens(con, "s1_norm", "s1_atok")
+    register_address_tokens(con, "cand_norm", "cand_atok")
 
     b1 = block_b1_exact_core(con, "s1_pc", "cand_pc")
     b2 = block_b2_rare_token(con, "s1_tok", "cand_tok", "suffix_table")
     b3 = block_b3_postal(con, "s1_pc", "cand_pc", "s1_tok", "cand_tok")
     bneighbor = block_b_sorted_neighborhood(con, "s1_pc", "cand_pc")
     bgeo = block_b_geo(con, "s1_geo", "cand_geo")
-    return dict(zip(BLOCK_NAMES, [b1, b2, b3, bneighbor, bgeo]))
+    baddr = block_b_address_rare_tokens(con, "s1_house", "cand_house", "s1_atok", "cand_atok")
+    results = [b1, b2, b3, bneighbor, bgeo, baddr]
+    if config.ENABLE_TFIDF_BLOCK:
+        results.append(block_b_tfidf_char_ngram(con, "s1_norm", "cand_norm", top_k=PER_BLOCK_CAP))
+    return dict(zip(BLOCK_NAMES, results))
 
 
 def block_and_cap_country(con: duckdb.DuckDBPyConnection, s1_country: pd.DataFrame, cand_country: pd.DataFrame) -> tuple:
