@@ -14,6 +14,7 @@ within a row.
 
 import csv
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,38 @@ def write_candidate_pairs(candidates: dict, required_ids, out_path: Path) -> Non
     a superset of matched_entity_ids for the same id).
     """
     _write_id_list_tsv(candidates, required_ids, "candidate_entity_ids", out_path)
+
+
+def write_candidate_pairs_from_parquet(parquet_glob: str, required_ids, out_path: Path, memory_limit: str = "4GB") -> int:
+    """candidate_pairs.tsv straight from the per-country capped-pairs parquet
+    files (columns s1_id, cand_id), without ever building a Python set per S1.
+
+    At full test scale that set-per-S1 dict is ~75M id strings (well over 10GB
+    of Python objects); here DuckDB aggregates each S1's candidates into one
+    comma-joined string (sorted), and only those strings (~1GB) are kept.
+    Inputs: glob of parquet files, every S1 id that MUST get a row, output path.
+    Output: number of S1 rows with at least one candidate.
+    """
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute(f"SET memory_limit = '{memory_limit}'")
+    con.execute(f"SET temp_directory = '{config.DUCKDB_TMP_DIR.as_posix()}'")
+    con.execute("SET preserve_insertion_order = false")
+    try:
+        rows = con.execute(
+            f"SELECT s1_id, string_agg(cand_id, ',' ORDER BY cand_id) FROM read_parquet('{parquet_glob}') GROUP BY s1_id"
+        ).fetchall()
+    finally:
+        con.close()
+    joined = dict(rows)
+    del rows
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for s1id in sorted(required_ids):
+            f.write(f"{s1id}\t{joined.get(s1id, '')}\n")
+    return len(joined)
 
 
 def run_validator(matching_path: Path, candidate_path: Path, test_dir: Path) -> tuple:

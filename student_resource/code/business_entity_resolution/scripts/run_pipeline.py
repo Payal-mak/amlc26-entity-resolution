@@ -101,6 +101,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lgbm-max-bin", default=None, type=int, help="LightGBM max_bin (255 default -- the library's own default). Env: AML_LGBM_MAX_BIN")
     p.add_argument("--lgbm-two-round", action="store_true", help="Force LightGBM two_round=True (off by default; a laptop-memory compromise, not needed on Kaggle). Env: AML_LGBM_TWO_ROUND")
     p.add_argument("--two-stage", action="store_true", help="Use the two-stage model (stage 2 re-scores with context features rebuilt from stage-1 OOF probabilities; off by default). Env: AML_TWO_STAGE")
+    p.add_argument(
+        "--train-source", default="full", choices=["full", "val"],
+        help="Data the FINAL model (the `train` stage) is fit on. 'full' (default) = every train pair from the "
+             "train_features stage (~100M rows on the real data: does not fit in 30GB of RAM). 'val' = the "
+             "validation-slice features already built by val_features (EVAL+CONTEXT, ~12M rows at the default "
+             "--val-target-total); with 'val', `--stage all` skips train_features.",
+    )
+    p.add_argument(
+        "--sample", default=0, type=int, metavar="N",
+        help="LOCAL CRASH TESTING ONLY (off by default): swap the data dir for a generated sample of ~N Source-1 "
+             "rows per split (scripts/make_sample_dataset.py) for every stage run in this invocation. Do not use "
+             "with val_slice/val_blocking (they need real geographic diversity) and never for a real run.",
+    )
     p.add_argument("--val-target-total", default=45000, type=int, help="Validation-slice size (scripts/build_validation_split.py). Use a small value (e.g. 2000) for a local smoke test.")
     p.add_argument(
         "--stage", default="all",
@@ -137,6 +150,23 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ["AML_LGBM_TWO_ROUND"] = "true"
     if args.two_stage:
         os.environ["AML_TWO_STAGE"] = "true"
+    if args.sample:
+        _use_sample_dataset(args)
+
+
+def _use_sample_dataset(args: argparse.Namespace) -> None:
+    """--sample N: build (once) a tiny dataset under <work dir>/sample_dataset and point AML_DATA_DIR at it.
+    Runs before src.config is imported, so it works out the real data/work dirs itself."""
+    repo_root = Path(__file__).resolve().parents[3]
+    real_data = Path(args.data_dir or os.environ.get("AML_DATA_DIR") or repo_root / "dataset")
+    default_work = "D:/amazon_ml_work" if Path("D:/").exists() else str(repo_root / ".work")
+    work = Path(args.work_dir or os.environ.get("AML_WORK_DIR") or default_work)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts import make_sample_dataset
+
+    out = make_sample_dataset.build_sample(real_data, work / "sample_dataset", args.sample)
+    os.environ["AML_DATA_DIR"] = str(out)
+    print(f"[sample] --sample {args.sample}: using {out} instead of the real dataset", flush=True)
 
 
 _args = _parse_args()
@@ -145,6 +175,7 @@ _apply_env(_args)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
 
 from src import blocking, config, decide, evaluate, features, io_utils, model, write_outputs  # noqa: E402
 from scripts import (  # noqa: E402
@@ -162,6 +193,7 @@ TEST_FEATURES_DIR = PIPELINE_DIR / "test"
 TEST_CANDIDATES_DIR = TEST_FEATURES_DIR / "candidates"
 MODEL_DIR = config.WORK_DIR / "models"
 MODEL_PATH = MODEL_DIR / "lgbm_folds.pkl"
+FEATURE_COLUMNS_PATH = MODEL_DIR / "feature_columns.json"
 TRAIN_REPORT_PATH = PIPELINE_DIR / "train_report.json"
 PREDICTIONS_PATH = PIPELINE_DIR / "test_predictions.parquet"
 
@@ -336,11 +368,15 @@ def build_country_pairs_and_features(
         cand_c = pd.concat([s2_c, s3_c], ignore_index=True)
         del s2_c, s3_c
 
-        capped_df, _ = blocking.block_and_cap_country(con, s1_c, cand_c)
+        # Same three steps as blocking.block_and_cap_country, but the capped pairs are
+        # written to parquet BY DUCKDB instead of being fetched into a pandas frame first:
+        # at full scale one country is 40M+ pairs (several GB of Python strings).
+        block_views = blocking.run_all_blocks(con, s1_c, cand_c)
+        capped_view = blocking.cap_candidates(con, blocking.union_and_score(con, block_views))
         pairs_path = out_dir / f"_capped_{country}.parquet"
-        capped_df.to_parquet(pairs_path, index=False)
+        io_utils.export_parquet(con, f"SELECT * FROM {capped_view}", pairs_path)
         if cand_out_dir is not None:
-            capped_df[["s1_id", "cand_id"]].to_parquet(cand_out_dir / f"capped_{country}.parquet", index=False)
+            io_utils.export_parquet(con, f"SELECT s1_id, cand_id FROM {capped_view}", cand_out_dir / f"capped_{country}.parquet")
         con.close()
 
         feat_out = out_dir / f"features_{country}.parquet"
@@ -350,7 +386,7 @@ def build_country_pairs_and_features(
             f"  country={country}: s1={len(s1_c)} cand={len(cand_c)} pairs={n_rows} "
             f"positives={n_pos} ({time.time()-tc:.1f}s)", flush=True,
         )
-        del s1_c, cand_c, capped_df
+        del s1_c, cand_c
         gc.collect()
     _reset_duckdb()
 
@@ -373,33 +409,57 @@ def stage_test_features() -> None:
     )
 
 
+def _save_feature_columns() -> None:
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    FEATURE_COLUMNS_PATH.write_text(json.dumps(features.FEATURE_COLUMNS), encoding="utf-8")
+
+
+def _check_feature_columns() -> None:
+    """The model was fit on a specific ordered column list; scoring with any other
+    list/order would silently feed features to the wrong trees."""
+    if not FEATURE_COLUMNS_PATH.exists():
+        raise RuntimeError(f"{FEATURE_COLUMNS_PATH} missing -- run the `train` stage (with this code version) first.")
+    trained_on = json.loads(FEATURE_COLUMNS_PATH.read_text(encoding="utf-8"))
+    if trained_on != features.FEATURE_COLUMNS:
+        raise RuntimeError(
+            "FEATURE_COLUMNS changed since the model was trained: "
+            f"missing now={sorted(set(trained_on) - set(features.FEATURE_COLUMNS))}, "
+            f"new={sorted(set(features.FEATURE_COLUMNS) - set(trained_on))}, or the order differs. Re-run `train`."
+        )
+
+
 def stage_train() -> dict:
-    """Fit the model actually used for test inference, on the FULL train
-    set (not the validation slice) -- more data than val_train sees, and
-    what predict/write use downstream. Also reports its own OOF numbers on
-    the full train set, as a secondary sanity check against val_train's
-    headline result: if they disagree sharply, that's a signal the
-    validation slice doesn't represent the full data well.
+    """Fit the model actually used for test inference. Also reports its own OOF
+    numbers as a sanity check.
+
+    --train-source full (default): every pair from `train_features` (the FULL train
+    set). --train-source val: the validation-slice features from `val_features`
+    (EVAL+CONTEXT design, realistic decoy density) -- what a 30GB machine can
+    actually hold; see the flag's help text.
     """
-    print("[train] loading full-train features...", flush=True)
-    frames = [pd.read_parquet(p) for p in sorted(TRAIN_FEATURES_DIR.glob("features_*.parquet"))]
+    if _args.train_source == "val":
+        print("[train] --train-source val: loading the validation-slice features...", flush=True)
+        frames = [pd.read_parquet(p) for p in sorted(phase4_train_and_decide.PHASE4_DIR.glob("features_*.parquet"))]
+        if not frames:
+            raise RuntimeError("no validation-slice features found -- run the val_features stage first")
+        eval_ids, truths, s1_country = phase4_train_and_decide.load_eval_ids_and_truth_and_country()
+    else:
+        print("[train] loading full-train features...", flush=True)
+        frames = [pd.read_parquet(p) for p in sorted(TRAIN_FEATURES_DIR.glob("features_*.parquet"))]
+        _reset_duckdb()
+        con = io_utils.get_connection()
+        io_utils.register_all_standard_views(con)
+        full_gt = load_ground_truth_map(con)
+        s1_country = dict(con.execute("SELECT entity_id, country FROM train_source1").fetchall())
+        con.close()
+        # Every train S1 must be scored, including ones blocking found zero candidates for
+        # (they still count in macro F0.5) -- not just the subset that appears in df.
+        eval_ids = set(s1_country.keys())
+        truths = {sid: full_gt.get(sid, set()) for sid in eval_ids}
     df = pd.concat(frames, ignore_index=True)
     del frames
     n_rows, n_positives = len(df), int(df["label"].sum())
     print(f"[train] {n_rows} rows, {n_positives} positives", flush=True)
-
-    _reset_duckdb()
-    con = io_utils.get_connection()
-    io_utils.register_all_standard_views(con)
-    full_gt = load_ground_truth_map(con)
-    s1_country = dict(con.execute("SELECT entity_id, country FROM train_source1").fetchall())
-    con.close()
-    # Every train S1 must be scored, including ones blocking found zero
-    # candidates for (they still count in macro F0.5, usually as a missed
-    # match unless they're a true singleton) -- not just the subset that
-    # happens to appear in df.
-    eval_ids = set(s1_country.keys())
-    truths = {sid: full_gt.get(sid, set()) for sid in eval_ids}
 
     X, y, groups = model.build_xy(df, features.FEATURE_COLUMNS)
     s1_ids, cand_ids = df["s1_id"].values, df["cand_id"].values
@@ -428,16 +488,18 @@ def stage_train() -> dict:
 
     report = evaluate.score_report(preds, truths, group_of=s1_country)
     report["policy"] = policy
+    report["train_source"] = _args.train_source
     report["two_stage"] = config.TWO_STAGE
     report["n_train_rows"] = n_rows
     report["n_positives"] = n_positives
     report["n_eval_ids"] = len(eval_ids)
     report["top_features"] = importance.head(15).values.tolist()
-    _print_metrics_report(report, "FULL-TRAIN OOF RESULTS (sanity check against val_train above)")
+    _print_metrics_report(report, "TRAIN-STAGE OOF RESULTS (--train-source %s)" % _args.train_source)
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(models, f)
+    _save_feature_columns()
 
     PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
     with open(TRAIN_REPORT_PATH, "w", encoding="utf-8") as f:
@@ -445,35 +507,78 @@ def stage_train() -> dict:
     return report
 
 
+# Pairs the model scores below this are dropped BEFORE the decision layer: at full
+# scale the scored test table is ~75M pairs (far too big for pandas), and a pair under
+# 0.5% can neither be picked nor change one-to-one assignment. Checked on the
+# validation slice: the decision layer's F0.5 is unchanged by it (see the commit message).
+PREDICT_PROBA_FLOOR = 0.005
+PREDICT_BATCH_ROWS = 2_000_000
+
+
+def _score_country(models, path: Path) -> pd.DataFrame:
+    """Score one country's test features file. Returns (s1_id, cand_id, proba)
+    for pairs at or above PREDICT_PROBA_FLOOR. Fold-model ensembles are scored
+    in 2M-row batches; the two-stage model needs every row of the country at
+    once (its context features are per-S1 / per-candidate), so it reads the
+    whole file -- fine for a slice, not for a 40M-row country."""
+    cols = ["s1_id", "cand_id"] + features.FEATURE_COLUMNS
+    parts = []
+    if isinstance(models, dict) and models.get("kind") == "two_stage":
+        chunk = pd.read_parquet(path, columns=cols)
+        proba = model.predict_two_stage_final(
+            models, chunk[features.FEATURE_COLUMNS].to_numpy(dtype="float32"), chunk["s1_id"].values, chunk["cand_id"].values
+        )
+        keep = proba >= PREDICT_PROBA_FLOOR
+        return pd.DataFrame({"s1_id": chunk["s1_id"].values[keep], "cand_id": chunk["cand_id"].values[keep], "proba": proba[keep]})
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=PREDICT_BATCH_ROWS, columns=cols):
+        chunk = batch.to_pandas()
+        # to_numpy(dtype=...), not .values -- see src/model.py's build_xy docstring.
+        proba = model.predict_with_fold_models(models, chunk[features.FEATURE_COLUMNS].to_numpy(dtype="float32"))
+        keep = proba >= PREDICT_PROBA_FLOOR
+        parts.append(pd.DataFrame({"s1_id": chunk["s1_id"].values[keep], "cand_id": chunk["cand_id"].values[keep], "proba": proba[keep]}))
+        del chunk, proba
+    if not parts:
+        return pd.DataFrame({"s1_id": [], "cand_id": [], "proba": []})
+    return pd.concat(parts, ignore_index=True)
+
+
 def stage_predict() -> dict:
-    print("[predict] loading test features + trained models...", flush=True)
-    frames = [pd.read_parquet(p) for p in sorted(TEST_FEATURES_DIR.glob("features_*.parquet"))]
-    df = pd.concat(frames, ignore_index=True)
-    del frames
+    print("[predict] loading trained models...", flush=True)
+    _check_feature_columns()
     with open(MODEL_PATH, "rb") as f:
         models = pickle.load(f)
-
-    # to_numpy(dtype=...), not .values -- see src/model.py's build_xy
-    # docstring/PROJECT_LOG.md: .values on a mixed-dtype selection builds an
-    # oversized float64-promoted array first regardless of what you cast it
-    # to afterward, which OOM'd for real on this machine at this row count.
-    X_test = df[features.FEATURE_COLUMNS].to_numpy(dtype="float32")
-    if isinstance(models, dict) and models.get("kind") == "two_stage":
-        # Whatever `train` saved decides the path -- no flag needed here.
-        df["proba"] = model.predict_two_stage_final(models, X_test, df["s1_id"].values, df["cand_id"].values)
-    else:
-        df["proba"] = model.predict_with_fold_models(models, X_test)
-    del X_test
 
     _reset_duckdb()
     con = io_utils.get_connection()
     io_utils.register_source_view(con, "test_source1", config.TEST_SOURCE1)
-    test_ids = {r[0] for r in con.execute("SELECT entity_id FROM test_source1").fetchall()}
+    ids_by_country = {}
+    for eid, country in con.execute("SELECT entity_id, country FROM test_source1").fetchall():
+        ids_by_country.setdefault(country, set()).add(eid)
     con.close()
+    test_ids = set().union(*ids_by_country.values()) if ids_by_country else set()
 
-    # No ground truth at real inference time -> decide() always falls back
-    # to the expected-F0.5 subset-selection policy (see src/decide.py).
-    preds, policy = decide.decide(df, test_ids, truths=None)
+    # One country at a time: blocking is within-country, so candidates, one-to-one
+    # assignment and the per-S1 decision never cross countries. Peak memory is one
+    # country's (pruned) scored pairs instead of the whole test set.
+    preds = {}
+    policy = "expected_f_beta_subset_selection"
+    for path in sorted(TEST_FEATURES_DIR.glob("features_*.parquet")):
+        country = path.stem[len("features_"):]
+        t0 = time.time()
+        scored = _score_country(models, path)
+        ids = ids_by_country.get(country, set())
+        # No ground truth at real inference time -> decide() always uses the
+        # expected-F0.5 subset-selection policy (see src/decide.py).
+        country_preds, policy = decide.decide(scored, ids, truths=None)
+        preds.update(country_preds)
+        print(
+            f"[predict] {country}: {len(ids)} S1, {len(scored)} pairs >= {PREDICT_PROBA_FLOOR}, "
+            f"{sum(1 for v in country_preds.values() if v)} matched ({time.time()-t0:.0f}s)", flush=True,
+        )
+        del scored, country_preds
+        gc.collect()
+    for eid in test_ids:
+        preds.setdefault(eid, set())  # a country with no feature file: predicted singleton
     n_matched = sum(1 for v in preds.values() if v)
     print(f"[predict] {n_matched} of {len(preds)} test S1 entities matched (policy={policy})", flush=True)
 
@@ -498,17 +603,14 @@ def stage_write() -> None:
     }
     required_ids = set(preds.keys())
 
-    candidates = {}
-    for p in sorted(TEST_CANDIDATES_DIR.glob("capped_*.parquet")):
-        cdf = pd.read_parquet(p)
-        for s1id, group in cdf.groupby("s1_id")["cand_id"]:
-            candidates[s1id] = set(group)
-
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     matching_path = config.OUTPUT_DIR / "matching_results.tsv"
     candidate_path = config.OUTPUT_DIR / "candidate_pairs.tsv"
     write_outputs.write_matching_results(preds, required_ids, matching_path)
-    write_outputs.write_candidate_pairs(candidates, required_ids, candidate_path)
+    n_with_candidates = write_outputs.write_candidate_pairs_from_parquet(
+        (TEST_CANDIDATES_DIR / "capped_*.parquet").as_posix(), required_ids, candidate_path
+    )
+    print(f"[write] {n_with_candidates} of {len(required_ids)} S1 have at least one candidate", flush=True)
     print(f"[write] wrote {matching_path} and {candidate_path}", flush=True)
 
     code, output = write_outputs.run_validator(matching_path, candidate_path, config.TEST_DIR)
@@ -579,6 +681,8 @@ def _run_stage_with_logging(name: str, fn) -> None:
 
 def main() -> None:
     stages_to_run = STAGE_ORDER if _args.stage == "all" else [_args.stage]
+    if _args.stage == "all" and _args.train_source == "val":
+        stages_to_run = [n for n in stages_to_run if n != "train_features"]  # unused when training on the val slice
     for name in stages_to_run:
         _run_stage_with_logging(name, STAGES[name])
 

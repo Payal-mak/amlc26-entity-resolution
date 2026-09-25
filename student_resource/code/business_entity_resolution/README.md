@@ -126,6 +126,26 @@ certain estimate -- plausibly **1-3 hours each**. Total for `--stage all`: **rou
 order of a few hours**, likely fitting a single Kaggle session but not by a wide
 margin. If it doesn't fit, `--stage <name>` resumes from wherever it stopped.
 
+**Scale: which flags a real Kaggle run needs.** A full-size run does not fit in 30GB with the
+defaults, for two reasons that only show up at real data size:
+- `train` with `--train-source full` (the default) loads every pair from `train_features`: roughly
+  100M rows x ~46 features (about 18GB of float32 alone before LightGBM copies it). Use
+  `--train-source val` to fit the final model on the validation-slice features instead (EVAL+CONTEXT,
+  about 8-12M rows at the default `--val-target-total 45000`); with it `--stage all` skips `train_features`.
+- `predict` and `write` now work country by country: scoring is streamed in 2M-row batches, pairs scoring
+  under 0.5% are dropped before the decision layer (no change in F0.5 -- checked on the validation
+  slice), and `candidate_pairs.tsv` is aggregated by DuckDB instead of a Python set per S1.
+Recommended: `--train-source val`, `--duckdb-memory 14GB` (leave RAM for the pandas frames; DuckDB
+spills to disk past its limit). See `kaggle/run_pipeline_kaggle.ipynb`.
+
+**Local crash test (`--sample N`, off by default).** `--sample 3000` swaps the data dir for a generated
+~3000-S1 sample (`scripts/make_sample_dataset.py`, built once under `<work dir>/sample_dataset`, France
+included) for every stage in that invocation. Use it for `train_features`, `train`, `test_features`,
+`predict`, `write`; not for `val_slice`/`val_blocking` (they need real geographic diversity -- run those
+on the real data with `--val-target-total 2000`). Example (after the val_* stages exist in the work dir):
+`python -m scripts.run_pipeline --sample 3000 --train-source val --stage train`, then the same for
+`test_features`, `predict`, `write`.
+
 **Two-stage model (optional, off by default).** `--two-stage` (or `AML_TWO_STAGE=true`)
 adds a second LightGBM pass whose extra inputs (rank / gap / reverse-rank / count of
 candidates above 0.5) are rebuilt from stage-1 out-of-fold probabilities. `train` then
