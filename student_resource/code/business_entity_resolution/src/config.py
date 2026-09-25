@@ -92,6 +92,11 @@ COL_SOURCE1_ENTITY_ID = "source1_entity_id"
 COL_MATCHED_ENTITY_IDS = "matched_entity_ids"
 COL_CANDIDATE_ENTITY_IDS = "candidate_entity_ids"
 
+# Two-stage model (src/model.py train_two_stage_oof): stage 2 re-scores every pair
+# with context features rebuilt from stage-1 out-of-fold probabilities. Off by
+# default; switch on with --two-stage on scripts/run_pipeline.py or AML_TWO_STAGE=true.
+TWO_STAGE = os.environ.get("AML_TWO_STAGE", "false").strip().lower() in ("1", "true", "yes")
+
 # Scoring.
 F_BETA = 0.5
 

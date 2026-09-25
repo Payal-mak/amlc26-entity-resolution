@@ -141,3 +141,97 @@ def feature_importance_report(models: list, feature_cols: list) -> pd.DataFrame:
         .sort_values("gain", ascending=False)
         .reset_index(drop=True)
     )
+
+
+# ---------------------------------------------------------------------------
+# Two-stage model
+# ---------------------------------------------------------------------------
+# Stage 1 is the ordinary model. Stage 2 sees the same features PLUS context
+# rebuilt from stage-1 probabilities: how a pair's probability ranks among its
+# S1's other candidates, among the other S1s competing for the same candidate,
+# and how many of its S1's candidates look like matches. The existing
+# rank_by_s1 / gap_to_best_by_s1 / reverse_rank features are computed from a
+# crude name-string ratio; these use the model's own opinion instead.
+#
+# No leakage: every stage-2 input for a row comes from stage-1 OUT-OF-FOLD
+# probabilities (a model that never saw that row's S1 group), and both stages
+# use the same deterministic GroupKFold-by-S1 splits. (Second-order effect,
+# standard in stacking: a training row's stage-1 OOF probability came from a
+# model that did see the stage-2 validation fold. Checked against a strictly
+# nested run (stage 1 refit inside every outer fold, exactly the test-time
+# recipe): 0.9399 nested vs 0.9371 here on the 2000-entity val slice, so the
+# shortcut does not inflate the score.)
+STAGE2_EXTRA_COLUMNS = ["s2_rank_by_s1", "s2_gap_to_best", "s2_reverse_rank", "s2_n_above_05"]
+STAGE2_ABOVE_THRESHOLD = 0.5
+
+
+def stage2_context_features(s1_ids, cand_ids, p1: np.ndarray, threshold: float = STAGE2_ABOVE_THRESHOLD) -> np.ndarray:
+    """(n, 4) float32 matrix, columns = STAGE2_EXTRA_COLUMNS, from stage-1
+    probabilities `p1` (one per pair; must be OOF for training rows). The raw
+    probability is deliberately NOT a column: tried, stage 2 then took 90% of
+    its gain from it and became a copy of stage 1.
+
+    s2_rank_by_s1: 1 = this S1's best candidate.
+    s2_gap_to_best: best probability among this S1's candidates minus this one.
+    s2_reverse_rank: 1 = the highest-probability S1 among those that list this
+    candidate. s2_n_above_05: how many of this S1's candidates have p1 > 0.5.
+    Ranks break ties by row order, so results are deterministic.
+    """
+    p1 = np.asarray(p1, dtype=np.float32)
+    df = pd.DataFrame({"s": pd.factorize(np.asarray(s1_ids))[0], "c": pd.factorize(np.asarray(cand_ids))[0], "p": p1})
+    by_s = df.groupby("s")["p"]
+    rank = by_s.rank(method="first", ascending=False)
+    gap = by_s.transform("max") - df["p"]
+    rrank = df.groupby("c")["p"].rank(method="first", ascending=False)
+    n_above = (df["p"] > threshold).astype(np.float32).groupby(df["s"]).transform("sum")
+    return np.ascontiguousarray(np.column_stack([rank, gap, rrank, n_above]), dtype=np.float32)
+
+
+def _with_stage2(X: np.ndarray, s1_ids, cand_ids, p1: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(np.hstack([X, stage2_context_features(s1_ids, cand_ids, p1)]), dtype=np.float32)
+
+
+def train_two_stage_oof(
+    X: np.ndarray, y: np.ndarray, groups: np.ndarray, s1_ids, cand_ids, feature_cols: list,
+    n_folds: int = 5, seed: int = 42, params: dict = None,
+) -> tuple:
+    """Out-of-fold probabilities from the two-stage model.
+
+    Inputs: X/y/groups from build_xy, the pair ids (aligned to X), feature
+    column names, folds/seed/params as in train_oof.
+    Output: (oof_stage2 probabilities, info dict with stage1_oof, models1,
+    models2, and importance = stage-2 gain report over feature_cols +
+    STAGE2_EXTRA_COLUMNS).
+    """
+    p1, models1, _ = train_oof(X, y, groups, n_folds=n_folds, seed=seed, params=params)
+    X2 = _with_stage2(X, s1_ids, cand_ids, p1)
+    p2, models2, _ = train_oof(X2, y, groups, n_folds=n_folds, seed=seed, params=params)
+    importance = feature_importance_report(models2, list(feature_cols) + STAGE2_EXTRA_COLUMNS)
+    return p2, {"stage1_oof": p1, "models1": models1, "models2": models2, "importance": importance}
+
+
+def fit_two_stage_final(X, y, s1_ids, cand_ids, stage1_oof: np.ndarray, seed: int = 42, params: dict = None) -> dict:
+    """The models used for test inference: stage 1 fit on ALL train rows, and
+    stage 2 fit on all train rows with features built from the stage-1 OOF
+    probabilities (never from the in-sample fit above).
+
+    Output: {"kind": "two_stage", "stage1": model, "stage2": model}.
+    """
+    p = dict(DEFAULT_PARAMS)
+    if params:
+        p.update(params)
+    p["random_state"] = seed
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    stage1 = LGBMClassifier(**p).fit(X, y)
+    stage2 = LGBMClassifier(**p).fit(_with_stage2(X, s1_ids, cand_ids, stage1_oof), y)
+    return {"kind": "two_stage", "stage1": stage1, "stage2": stage2}
+
+
+def predict_two_stage_final(final: dict, X: np.ndarray, s1_ids, cand_ids) -> np.ndarray:
+    """Score unseen rows (e.g. the test set): stage-1 probabilities from the
+    full-train stage-1 model, stage-2 features rebuilt from those, then the
+    stage-2 model. Needs ALL of the rows' candidates at once (context features
+    are per-S1 / per-candidate), so pass the whole test feature table."""
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    p1 = final["stage1"].predict_proba(X)[:, 1]
+    return final["stage2"].predict_proba(_with_stage2(X, s1_ids, cand_ids, p1))[:, 1]

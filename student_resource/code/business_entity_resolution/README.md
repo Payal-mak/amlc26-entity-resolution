@@ -126,6 +126,14 @@ certain estimate -- plausibly **1-3 hours each**. Total for `--stage all`: **rou
 order of a few hours**, likely fitting a single Kaggle session but not by a wide
 margin. If it doesn't fit, `--stage <name>` resumes from wherever it stopped.
 
+**Two-stage model (optional, off by default).** `--two-stage` (or `AML_TWO_STAGE=true`)
+adds a second LightGBM pass whose extra inputs (rank / gap / reverse-rank / count of
+candidates above 0.5) are rebuilt from stage-1 out-of-fold probabilities. `train` then
+saves stage-1/stage-2 models fit on all train rows and `predict` picks the path from
+whatever `train` saved. On the 2000-entity validation slice it did **not** beat the single
+stage (see PROJECT_LOG.md / the branch notes), and it roughly doubles training time -- leave it off
+unless a full-size `val_train` shows a gain.
+
 Resume just one stage (e.g. after fixing a bug found in `predict`):
 
 ```

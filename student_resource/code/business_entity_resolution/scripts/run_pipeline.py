@@ -100,6 +100,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lgbm-threads", default=None, type=int, help="LightGBM n_jobs (4 default). Env: AML_LGBM_THREADS")
     p.add_argument("--lgbm-max-bin", default=None, type=int, help="LightGBM max_bin (255 default -- the library's own default). Env: AML_LGBM_MAX_BIN")
     p.add_argument("--lgbm-two-round", action="store_true", help="Force LightGBM two_round=True (off by default; a laptop-memory compromise, not needed on Kaggle). Env: AML_LGBM_TWO_ROUND")
+    p.add_argument("--two-stage", action="store_true", help="Use the two-stage model (stage 2 re-scores with context features rebuilt from stage-1 OOF probabilities; off by default). Env: AML_TWO_STAGE")
     p.add_argument("--val-target-total", default=45000, type=int, help="Validation-slice size (scripts/build_validation_split.py). Use a small value (e.g. 2000) for a local smoke test.")
     p.add_argument(
         "--stage", default="all",
@@ -134,6 +135,8 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ["AML_LGBM_MAX_BIN"] = str(args.lgbm_max_bin)
     if args.lgbm_two_round:
         os.environ["AML_LGBM_TWO_ROUND"] = "true"
+    if args.two_stage:
+        os.environ["AML_TWO_STAGE"] = "true"
 
 
 _args = _parse_args()
@@ -405,9 +408,18 @@ def stage_train() -> dict:
     del df
     gc.collect()
 
-    oof_proba, models, _ = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
-    print("[train] trained 5-fold GroupKFold LightGBM -- these are the models predict/write use", flush=True)
-    importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
+    if config.TWO_STAGE:
+        oof_proba, info = model.train_two_stage_oof(
+            X, y, groups, s1_ids, cand_ids, features.FEATURE_COLUMNS, n_folds=5, seed=config.RANDOM_SEED
+        )
+        importance = info["importance"]
+        print("[train] trained 2-stage 5-fold GroupKFold LightGBM (OOF); fitting the full-train stage-1/stage-2 models predict uses", flush=True)
+        models = model.fit_two_stage_final(X, y, s1_ids, cand_ids, info["stage1_oof"], seed=config.RANDOM_SEED)
+        del info
+    else:
+        oof_proba, models, _ = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
+        print("[train] trained 5-fold GroupKFold LightGBM -- these are the models predict/write use", flush=True)
+        importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
     del X, y, groups
     gc.collect()
 
@@ -416,6 +428,7 @@ def stage_train() -> dict:
 
     report = evaluate.score_report(preds, truths, group_of=s1_country)
     report["policy"] = policy
+    report["two_stage"] = config.TWO_STAGE
     report["n_train_rows"] = n_rows
     report["n_positives"] = n_positives
     report["n_eval_ids"] = len(eval_ids)
@@ -444,7 +457,13 @@ def stage_predict() -> dict:
     # docstring/PROJECT_LOG.md: .values on a mixed-dtype selection builds an
     # oversized float64-promoted array first regardless of what you cast it
     # to afterward, which OOM'd for real on this machine at this row count.
-    df["proba"] = model.predict_with_fold_models(models, df[features.FEATURE_COLUMNS].to_numpy(dtype="float32"))
+    X_test = df[features.FEATURE_COLUMNS].to_numpy(dtype="float32")
+    if isinstance(models, dict) and models.get("kind") == "two_stage":
+        # Whatever `train` saved decides the path -- no flag needed here.
+        df["proba"] = model.predict_two_stage_final(models, X_test, df["s1_id"].values, df["cand_id"].values)
+    else:
+        df["proba"] = model.predict_with_fold_models(models, X_test)
+    del X_test
 
     _reset_duckdb()
     con = io_utils.get_connection()

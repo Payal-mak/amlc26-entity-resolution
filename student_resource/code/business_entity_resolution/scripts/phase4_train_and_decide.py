@@ -70,9 +70,16 @@ def run() -> dict:
     del df
     gc.collect()
 
-    oof_proba, models, fold_id = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
-    print(f"trained 5-fold GroupKFold LightGBM ({time.time()-t0:.1f}s)")
-    importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
+    if config.TWO_STAGE:
+        oof_proba, info = model.train_two_stage_oof(
+            X, y, groups, s1_ids, cand_ids, features.FEATURE_COLUMNS, n_folds=5, seed=config.RANDOM_SEED
+        )
+        print(f"trained 2-stage 5-fold GroupKFold LightGBM ({time.time()-t0:.1f}s)")
+        importance = info["importance"]
+    else:
+        oof_proba, models, fold_id = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
+        print(f"trained 5-fold GroupKFold LightGBM ({time.time()-t0:.1f}s)")
+        importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
     del X, y, groups
     gc.collect()
 
@@ -82,6 +89,7 @@ def run() -> dict:
 
     report = evaluate.score_report(preds, truths, group_of=s1_country)
     report["policy"] = policy
+    report["two_stage"] = config.TWO_STAGE
     report["n_train_rows"] = n_rows
     report["n_positives"] = n_positives
     report["build_time_seconds"] = round(time.time() - t0, 1)
