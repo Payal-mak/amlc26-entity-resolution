@@ -1,0 +1,31 @@
+# Challenge data must NEVER be pushed to GitHub
+student_resource/dataset/
+*.tsv
+*.parquet
+*.duckdb
+
+# Generated outputs / submissions (never commit results, only code)
+student_resource/output/
+submissions/*
+!submissions/.gitkeep
+
+# Model artifacts (LightGBM text dumps, pickles, binaries)
+*.pkl
+*.bin
+lightgbm_model*.txt
+model*.txt
+!requirements.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local working-dir artifacts / logs
+*.log
+
+# OS / editor junk
+.DS_Store
+__MACOSX/
+.claude/
