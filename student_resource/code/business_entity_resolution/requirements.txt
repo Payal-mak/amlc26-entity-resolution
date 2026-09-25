@@ -7,3 +7,4 @@ indic-transliteration==2.3.82  # MIT license; Devanagari->Latin romanization (sr
 rapidfuzz==3.14.6  # MIT license; token alignment (scripts/build_translit_token_map.py)
 lightgbm==4.7.0  # MIT license; pairwise match/no-match classifier (src/model.py)
 scikit-learn==1.5.1  # BSD-3-Clause; GroupKFold only (src/model.py)
+psutil==7.0.0  # BSD-3-Clause; per-stage peak-memory logging (scripts/run_pipeline.py)

@@ -4,6 +4,8 @@ student_resource/dataset/
 *.parquet
 *.duckdb
 *.zip
+*.pdf
+*.png
 
 # Generated outputs / submissions (never commit results, only code)
 student_resource/output/

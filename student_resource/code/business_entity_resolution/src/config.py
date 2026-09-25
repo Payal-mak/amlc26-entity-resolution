@@ -58,15 +58,25 @@ PARQUET_DIR = WORK_DIR / "parquet"
 SUBMISSIONS_DIR = REPO_ROOT / "submissions"
 DUCKDB_PATH = DUCKDB_DIR / "aml.duckdb"
 
-# DuckDB memory ceiling. Machine has 8GB total / ~1.6GB free at times, so keep
-# this conservative and let DuckDB spill to DUCKDB_TMP_DIR (on D:) past this.
-# threads=2 (not more) and max_temp_directory_size are both explicit after two
-# blocking-stage OOM crashes (Phase 3, PROJECT_LOG.md) -- fewer threads means
-# fewer large intermediates alive at once, and a hard temp-dir cap turns "fill
-# the disk" into a normal query error instead of a machine-wide problem.
-DUCKDB_MEMORY_LIMIT = os.environ.get("AML_DUCKDB_MEMORY_LIMIT", "3GB")
-DUCKDB_THREADS = int(os.environ.get("AML_DUCKDB_THREADS", "2"))
+# DuckDB memory ceiling. Defaults now assume Kaggle (31GB RAM, 4 CPUs) -- the
+# real/full-size runs all happen there as of 2026-09-25 (see PROJECT_LOG.md:
+# repeated local OOMs even after several rounds of memory-safety patches).
+# Local runs are dev-only smoke tests on tiny samples, where the actual usage
+# stays far under whatever the ceiling is set to regardless -- override with
+# AML_DUCKDB_MEMORY_LIMIT/AML_DUCKDB_THREADS if that ever stops being true.
+DUCKDB_MEMORY_LIMIT = os.environ.get("AML_DUCKDB_MEMORY_LIMIT", "20GB")
+DUCKDB_THREADS = int(os.environ.get("AML_DUCKDB_THREADS", "4"))
 DUCKDB_MAX_TEMP_DIRECTORY_SIZE = os.environ.get("AML_DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "30GB")
+
+# LightGBM knobs (src/model.py). Same reasoning as the DuckDB settings above:
+# Kaggle-appropriate defaults (real thread count, the library's own default
+# max_bin, two_round off), overridable via env var for the rare case a local
+# run needs the laptop-safe compromises back (max_bin=63/two_round=True/
+# n_jobs=1 -- see PROJECT_LOG.md for why those existed briefly and were
+# reverted once Kaggle was confirmed working).
+LGBM_NUM_THREADS = int(os.environ.get("AML_LGBM_THREADS", "4"))
+LGBM_MAX_BIN = int(os.environ.get("AML_LGBM_MAX_BIN", "255"))
+LGBM_TWO_ROUND = os.environ.get("AML_LGBM_TWO_ROUND", "false").strip().lower() in ("1", "true", "yes")
 
 # Entity id prefixes / column names, used instead of literals across modules.
 SOURCE1_PREFIX = "S1-"

@@ -1,19 +1,33 @@
-"""Single end-to-end entry point: normalize -> blocking -> features -> train
--> predict -> write outputs. Driven entirely by CLI flags / AML_* env vars
-(see src/config.py's module docstring) so the identical code runs unmodified
-on the local dev machine (Windows, D: drive) and on Kaggle
-(/kaggle/input/<dataset>/dataset, /kaggle/working, /kaggle/temp) -- nothing
-in this file hardcodes a drive letter or OS-specific path.
+"""Single end-to-end entry point: normalize -> validation-slice OOF report ->
+blocking (train + test) -> features -> fit the final model -> test inference
+-> decision layer -> write output/matching_results.tsv + candidate_pairs.tsv.
+Driven entirely by CLI flags / AML_* env vars (see src/config.py's module
+docstring) so the identical code runs unmodified locally and on Kaggle --
+nothing in this file hardcodes a drive letter, OS-specific path, or a
+laptop-safe compromise (see src/model.py's DEFAULT_PARAMS for why those were
+reverted: real full-size runs happen on Kaggle now, not this 8GB machine).
 
 Stages (run in order by --stage all, the default):
   normalize      learn suffix tokens + a transliteration token map from the
                  FULL train+test data (country-agnostic, so France gets a
                  suffix list too even with zero training rows).
-  train_features block + build labeled features for train_source1 vs
-                 train_source2/3, per country, streamed to parquet.
-  train          GroupKFold LightGBM over every features_train_*.parquet;
-                 reports OOF macro F0.5/precision/recall on the full train
-                 set; saves the fold models.
+  val_slice      build the held-out validation slice from dataset/train/
+                 (scripts/build_validation_split.py) -- --val-target-total
+                 controls its size; small for a local smoke test.
+  val_blocking   block + cap candidates on that slice, report recall
+                 (scripts/phase3_blocking_report.py).
+  val_features   build labeled features for the slice
+                 (scripts/phase4_build_features.py).
+  val_train      GroupKFold LightGBM OOF training + decision layer on the
+                 slice; prints macro F0.5/precision/recall/singleton
+                 accuracy, overall and per country -- THE headline validation
+                 number (scripts/phase4_train_and_decide.py).
+  train_features block + build labeled features for the FULL train_source1
+                 vs train_source2/3, per country, streamed to parquet.
+  train          fit the model actually used for test inference: GroupKFold
+                 LightGBM over every features_train_*.parquet (also reports
+                 its own OOF numbers on the full train set as a sanity
+                 check); saves the fold models.
   test_features  block + build UNlabeled features for test_source1 vs
                  test_source2/3, per country (also saves the raw candidate
                  pairs -- needed for candidate_pairs.tsv).
@@ -28,13 +42,17 @@ crash partway through only costs the stage it was on -- re-run with
 `--stage <name>` to resume instead of redoing everything with `--stage all`.
 
 Usage (from code/business_entity_resolution/):
-    # local dev machine (config.py's defaults already point at D:/amazon_ml_work)
-    python -m scripts.run_pipeline
+    # local dev machine -- SMOKE TEST ONLY, tiny validation slice, no real
+    # train/test-scale run (see PROJECT_LOG.md: repeated local OOMs on the
+    # real data even after several rounds of memory-safety fixes)
+    python -m scripts.run_pipeline --val-target-total 2000 --stage normalize
+    python -m scripts.run_pipeline --val-target-total 2000 --stage val_slice
+    ... (val_blocking, val_features, val_train to check the wiring end to end)
 
-    # Kaggle
+    # Kaggle -- the real run
     python -m scripts.run_pipeline \\
         --data-dir /kaggle/input/<dataset-name>/dataset \\
-        --work-dir /kaggle/temp/amazon_ml_work \\
+        --work-dir /tmp/work \\
         --output-dir /kaggle/working/output \\
         --duckdb-memory 20GB --duckdb-threads 4
 
@@ -44,25 +62,32 @@ Usage (from code/business_entity_resolution/):
 """
 
 # MUST be the first import in this process, before pandas/duckdb/pyarrow --
-# on the dev machine, importing lightgbm AFTER pandas has already loaded its
-# native extensions causes a reproducible access violation deep inside
-# LightGBM's C API (crashes on any data, in set_label, regardless of row
-# count/dtype/contiguity -- isolated by bisecting import order; see
+# on the local dev machine, importing lightgbm AFTER pandas has already
+# loaded its native extensions causes a reproducible access violation deep
+# inside LightGBM's C API (crashes on any data, in set_label, regardless of
+# row count/dtype/contiguity -- isolated by bisecting import order; see
 # PROJECT_LOG.md). Importing lightgbm first sidesteps whatever DLL/runtime
-# it conflicts with. Every stage in this file eventually trains or predicts
-# with LightGBM, so this has to be first even for stages that don't need it
-# themselves (e.g. --stage normalize) -- there's no cheap way to defer it
-# only to the stages that do.
+# it conflicts with. Not yet confirmed whether Kaggle's environment has the
+# same issue; keeping the guard everywhere costs nothing if it doesn't. Every
+# stage in this file eventually trains or predicts with LightGBM, so this has
+# to be first even for stages that don't need it themselves.
 import lightgbm  # noqa: F401,E402
 
 import argparse
+import datetime
 import gc
 import json
 import os
 import pickle
 import sys
+import threading
 import time
 from pathlib import Path
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover -- degrades to no peak-memory logging
+    psutil = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -70,11 +95,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", default=None, help="Dataset root (contains train/, test/). Env: AML_DATA_DIR")
     p.add_argument("--work-dir", default=None, help="Large-artifact scratch dir (parquet/duckdb, never committed). Env: AML_WORK_DIR")
     p.add_argument("--output-dir", default=None, help="Final submission output dir. Env: AML_OUTPUT_DIR")
-    p.add_argument("--duckdb-memory", default=None, help="DuckDB memory_limit, e.g. 1GB (local) / 20GB (Kaggle). Env: AML_DUCKDB_MEMORY_LIMIT")
-    p.add_argument("--duckdb-threads", default=None, type=int, help="DuckDB thread count. Env: AML_DUCKDB_THREADS")
+    p.add_argument("--duckdb-memory", default=None, help="DuckDB memory_limit, e.g. 20GB (Kaggle default). Env: AML_DUCKDB_MEMORY_LIMIT")
+    p.add_argument("--duckdb-threads", default=None, type=int, help="DuckDB thread count (4 default). Env: AML_DUCKDB_THREADS")
+    p.add_argument("--lgbm-threads", default=None, type=int, help="LightGBM n_jobs (4 default). Env: AML_LGBM_THREADS")
+    p.add_argument("--lgbm-max-bin", default=None, type=int, help="LightGBM max_bin (255 default -- the library's own default). Env: AML_LGBM_MAX_BIN")
+    p.add_argument("--lgbm-two-round", action="store_true", help="Force LightGBM two_round=True (off by default; a laptop-memory compromise, not needed on Kaggle). Env: AML_LGBM_TWO_ROUND")
+    p.add_argument("--val-target-total", default=45000, type=int, help="Validation-slice size (scripts/build_validation_split.py). Use a small value (e.g. 2000) for a local smoke test.")
     p.add_argument(
         "--stage", default="all",
-        choices=["all", "normalize", "train_features", "train", "test_features", "predict", "write"],
+        choices=[
+            "all", "normalize", "val_slice", "val_blocking", "val_features", "val_train",
+            "train_features", "train", "test_features", "predict", "write",
+        ],
         help="Run one stage only, or 'all' (default) to run every stage in order.",
     )
     return p.parse_args()
@@ -83,8 +115,8 @@ def _parse_args() -> argparse.Namespace:
 def _apply_env(args: argparse.Namespace) -> None:
     """Set AML_* env vars from CLI flags. Must run BEFORE `from src import
     config` anywhere in this process -- config.py reads these at import time
-    to build every path constant, so importing it first would bake in the
-    wrong defaults.
+    to build every path/param constant, so importing it first would bake in
+    the wrong values.
     """
     if args.data_dir:
         os.environ["AML_DATA_DIR"] = args.data_dir
@@ -96,6 +128,12 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ["AML_DUCKDB_MEMORY_LIMIT"] = args.duckdb_memory
     if args.duckdb_threads:
         os.environ["AML_DUCKDB_THREADS"] = str(args.duckdb_threads)
+    if args.lgbm_threads:
+        os.environ["AML_LGBM_THREADS"] = str(args.lgbm_threads)
+    if args.lgbm_max_bin:
+        os.environ["AML_LGBM_MAX_BIN"] = str(args.lgbm_max_bin)
+    if args.lgbm_two_round:
+        os.environ["AML_LGBM_TWO_ROUND"] = "true"
 
 
 _args = _parse_args()
@@ -106,7 +144,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pandas as pd  # noqa: E402
 
 from src import blocking, config, decide, evaluate, features, io_utils, model, write_outputs  # noqa: E402
-from scripts import build_translit_token_map, phase2_normalization_report  # noqa: E402
+from scripts import (  # noqa: E402
+    build_translit_token_map,
+    build_validation_split,
+    phase2_normalization_report,
+    phase3_blocking_report,
+    phase4_build_features,
+    phase4_train_and_decide,
+)
 
 PIPELINE_DIR = config.PARQUET_DIR / "pipeline"
 TRAIN_FEATURES_DIR = PIPELINE_DIR / "train"
@@ -116,6 +161,17 @@ MODEL_DIR = config.WORK_DIR / "models"
 MODEL_PATH = MODEL_DIR / "lgbm_folds.pkl"
 TRAIN_REPORT_PATH = PIPELINE_DIR / "train_report.json"
 PREDICTIONS_PATH = PIPELINE_DIR / "test_predictions.parquet"
+
+
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _rss_mb():
+    """Current process RSS in MB, or None if psutil isn't installed."""
+    if psutil is None:
+        return None
+    return psutil.Process().memory_info().rss / (1024 * 1024)
 
 
 def _reset_duckdb() -> None:
@@ -167,11 +223,68 @@ def load_ground_truth_map(con) -> dict:
     }
 
 
+def _print_metrics_report(report: dict, title: str) -> None:
+    """Print a clearly-delimited, human-scannable block for an
+    evaluate.score_report() dict -- overall macro F0.5 (the official metric),
+    micro precision/recall, singleton accuracy, and the per-country
+    breakdown. Meant to stand out in a long Kaggle log.
+    """
+    print("", flush=True)
+    print("=" * 78, flush=True)
+    print(title, flush=True)
+    print("=" * 78, flush=True)
+    print(f"  policy: {report.get('policy')}", flush=True)
+    print(
+        f"  n_entities={report.get('n_entities')}  "
+        f"n_train_rows={report.get('n_train_rows')}  n_positives={report.get('n_positives')}",
+        flush=True,
+    )
+    f_beta = report.get("macro_f_beta")
+    print(f"  macro F0.5 (OFFICIAL METRIC): {f_beta:.4f}" if f_beta is not None else "  macro F0.5: n/a", flush=True)
+    mp, mr = report.get("micro_precision"), report.get("micro_recall")
+    print(f"  micro precision: {mp:.4f}  micro recall: {mr:.4f}" if mp is not None else "  micro precision/recall: n/a", flush=True)
+    print(f"  singleton accuracy: {report.get('singleton_accuracy')}", flush=True)
+    by_group = report.get("by_group") or {}
+    if by_group:
+        print("  by country:", flush=True)
+        for country in sorted(by_group):
+            g = by_group[country]
+            print(
+                f"    {country:12s} n={g['n']:>7}  F0.5={g['f_beta']:.4f}  "
+                f"precision={g['precision']:.4f}  recall={g['recall']:.4f}",
+                flush=True,
+            )
+    print("=" * 78, flush=True)
+    print("", flush=True)
+
+
 def stage_normalize() -> None:
     print("[normalize] learning data-driven suffix tokens (full train+test)...", flush=True)
     phase2_normalization_report.run()
     print("[normalize] learning transliteration token map (full train ground truth)...", flush=True)
     build_translit_token_map.run()
+
+
+def stage_val_slice() -> None:
+    print(f"[val_slice] building validation slice, target_total={_args.val_target_total}...", flush=True)
+    build_validation_split.build(_args.val_target_total)
+
+
+def stage_val_blocking() -> None:
+    print("[val_blocking] blocking + capping candidates on the validation slice...", flush=True)
+    phase3_blocking_report.run()
+
+
+def stage_val_features() -> None:
+    print("[val_features] building labeled features on the validation slice...", flush=True)
+    phase4_build_features.run()
+
+
+def stage_val_train() -> dict:
+    print("[val_train] GroupKFold LightGBM OOF training + decision layer on the validation slice...", flush=True)
+    report = phase4_train_and_decide.run()
+    _print_metrics_report(report, "VALIDATION-SLICE OOF RESULTS (scripts/phase4_train_and_decide.py)")
+    return report
 
 
 def build_country_pairs_and_features(
@@ -258,11 +371,19 @@ def stage_test_features() -> None:
 
 
 def stage_train() -> dict:
-    print("[train] loading train features...", flush=True)
+    """Fit the model actually used for test inference, on the FULL train
+    set (not the validation slice) -- more data than val_train sees, and
+    what predict/write use downstream. Also reports its own OOF numbers on
+    the full train set, as a secondary sanity check against val_train's
+    headline result: if they disagree sharply, that's a signal the
+    validation slice doesn't represent the full data well.
+    """
+    print("[train] loading full-train features...", flush=True)
     frames = [pd.read_parquet(p) for p in sorted(TRAIN_FEATURES_DIR.glob("features_*.parquet"))]
     df = pd.concat(frames, ignore_index=True)
     del frames
-    print(f"[train] {len(df)} rows, {int(df['label'].sum())} positives", flush=True)
+    n_rows, n_positives = len(df), int(df["label"].sum())
+    print(f"[train] {n_rows} rows, {n_positives} positives", flush=True)
 
     _reset_duckdb()
     con = io_utils.get_connection()
@@ -277,20 +398,29 @@ def stage_train() -> dict:
     eval_ids = set(s1_country.keys())
     truths = {sid: full_gt.get(sid, set()) for sid in eval_ids}
 
-    oof_proba, models, _ = model.train_oof(df, features.FEATURE_COLUMNS, n_folds=5, seed=config.RANDOM_SEED)
-    df["proba"] = oof_proba
-    print(f"[train] trained 5-fold GroupKFold LightGBM", flush=True)
-    importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
+    X, y, groups = model.build_xy(df, features.FEATURE_COLUMNS)
+    s1_ids, cand_ids = df["s1_id"].values, df["cand_id"].values
+    # Free the full features dataframe before training -- see src/model.py's
+    # build_xy docstring / PROJECT_LOG.md for the real OOM this avoids.
+    del df
+    gc.collect()
 
+    oof_proba, models, _ = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
+    print("[train] trained 5-fold GroupKFold LightGBM -- these are the models predict/write use", flush=True)
+    importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
+    del X, y, groups
+    gc.collect()
+
+    df = pd.DataFrame({"s1_id": s1_ids, "cand_id": cand_ids, "proba": oof_proba})
     preds, policy = decide.decide(df, eval_ids, truths=truths)
-    print(f"[train] decision policy selected: {policy}", flush=True)
 
     report = evaluate.score_report(preds, truths, group_of=s1_country)
     report["policy"] = policy
-    report["n_train_rows"] = len(df)
-    report["n_positives"] = int(df["label"].sum())
+    report["n_train_rows"] = n_rows
+    report["n_positives"] = n_positives
     report["n_eval_ids"] = len(eval_ids)
     report["top_features"] = importance.head(15).values.tolist()
+    _print_metrics_report(report, "FULL-TRAIN OOF RESULTS (sanity check against val_train above)")
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
@@ -299,7 +429,6 @@ def stage_train() -> dict:
     PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
     with open(TRAIN_REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str, ensure_ascii=False)
-    print(f"[train] macro F0.5={report.get('macro_f_beta')}", flush=True)
     return report
 
 
@@ -311,7 +440,11 @@ def stage_predict() -> dict:
     with open(MODEL_PATH, "rb") as f:
         models = pickle.load(f)
 
-    df["proba"] = model.predict_with_fold_models(models, df[features.FEATURE_COLUMNS].values)
+    # to_numpy(dtype=...), not .values -- see src/model.py's build_xy
+    # docstring/PROJECT_LOG.md: .values on a mixed-dtype selection builds an
+    # oversized float64-promoted array first regardless of what you cast it
+    # to afterward, which OOM'd for real on this machine at this row count.
+    df["proba"] = model.predict_with_fold_models(models, df[features.FEATURE_COLUMNS].to_numpy(dtype="float32"))
 
     _reset_duckdb()
     con = io_utils.get_connection()
@@ -371,22 +504,64 @@ def stage_write() -> None:
 
 STAGES = {
     "normalize": stage_normalize,
+    "val_slice": stage_val_slice,
+    "val_blocking": stage_val_blocking,
+    "val_features": stage_val_features,
+    "val_train": stage_val_train,
     "train_features": stage_train_features,
     "train": stage_train,
     "test_features": stage_test_features,
     "predict": stage_predict,
     "write": stage_write,
 }
-STAGE_ORDER = ["normalize", "train_features", "train", "test_features", "predict", "write"]
+STAGE_ORDER = [
+    "normalize", "val_slice", "val_blocking", "val_features", "val_train",
+    "train_features", "train", "test_features", "predict", "write",
+]
+
+
+def _run_stage_with_logging(name: str, fn) -> None:
+    """Run one stage with a timestamped start/end line and the stage's peak
+    RSS in between (polled every 2s on a background thread -- there's no
+    single cross-platform "peak memory" call that works identically on
+    Windows and Kaggle's Linux, so this approximates it, which is enough for
+    reading off a log).
+    """
+    start_rss = _rss_mb()
+    start_note = f" (rss={start_rss:.0f}MB)" if start_rss is not None else ""
+    print(f"[{_now()}] === stage: {name} start{start_note} ===", flush=True)
+
+    peak = {"mb": start_rss or 0.0}
+    stop = threading.Event()
+
+    def _poll() -> None:
+        while not stop.wait(2):
+            m = _rss_mb()
+            if m is not None and m > peak["mb"]:
+                peak["mb"] = m
+
+    poller = None
+    if psutil is not None:
+        poller = threading.Thread(target=_poll, daemon=True)
+        poller.start()
+
+    t0 = time.time()
+    try:
+        fn()
+    finally:
+        if poller is not None:
+            stop.set()
+            poller.join(timeout=3)
+
+    dt = time.time() - t0
+    peak_note = f", peak_rss={peak['mb']:.0f}MB" if psutil is not None else ""
+    print(f"[{_now()}] === stage: {name} done ({dt:.1f}s{peak_note}) ===", flush=True)
 
 
 def main() -> None:
     stages_to_run = STAGE_ORDER if _args.stage == "all" else [_args.stage]
     for name in stages_to_run:
-        t0 = time.time()
-        print(f"=== stage: {name} ===", flush=True)
-        STAGES[name]()
-        print(f"=== stage {name} done ({time.time()-t0:.1f}s) ===", flush=True)
+        _run_stage_with_logging(name, STAGES[name])
 
 
 if __name__ == "__main__":

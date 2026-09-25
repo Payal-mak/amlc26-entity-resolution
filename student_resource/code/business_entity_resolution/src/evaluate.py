@@ -111,7 +111,10 @@ def per_group_macro_f_beta(
     Inputs: preds, truths as above; group_of maps source1_entity_id -> group
     label (e.g. the S1 record's country). Entities missing from group_of are
     reported under group "unknown".
-    Output: {group_label: {"f_beta": .., "n": ..}}, one entry per group found.
+    Output: {group_label: {"f_beta", "precision", "recall", "n"}} (precision/
+    recall are the same micro/pooled diagnostic as micro_precision_recall,
+    scoped to that group -- not the official metric, but what "precision/
+    recall per country" in a log means in practice), one entry per group.
     """
     buckets: Dict[str, Dict[str, IdSet]] = {}
     for s1, truth_set in truths.items():
@@ -120,8 +123,11 @@ def per_group_macro_f_beta(
 
     report = {}
     for g, group_truths in buckets.items():
+        pr = micro_precision_recall(preds, group_truths)
         report[g] = {
             "f_beta": macro_f_beta(preds, group_truths, beta),
+            "precision": pr["precision"],
+            "recall": pr["recall"],
             "n": len(group_truths),
         }
     return report

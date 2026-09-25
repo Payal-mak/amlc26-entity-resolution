@@ -735,3 +735,95 @@ Added `lightgbm==4.7.0` (MIT) and `scikit-learn==1.5.1` (BSD-3-Clause) to
 ### Next
 Run `scripts.phase4_train_and_decide` on the real completed features (India + US) and
 report val F0.5/precision/recall/singleton accuracy, overall and per country.
+
+## 2026-09-25 — Two more real local OOMs, then the decision: Kaggle for everything real
+
+### Two more genuine crashes training on the real India+US features (11.56M rows)
+1. `df[feature_cols].values` promoted to **float64** before an `np.ascontiguousarray(...,
+   dtype=np.float32)` cast could ever apply -- pandas' block-manager interleave picks
+   the array's dtype from the mixed-dtype columns (float32 features + int64 rank
+   columns) at `.values` time, ignoring what you cast it to afterward. Needed 2.15GiB
+   and failed. Fixed the *pattern* (not just the one call site) by switching to
+   `df[cols].to_numpy(dtype=np.float32)`, which threads the target dtype into the
+   initial allocation (~1.08GiB instead).
+2. Past that, LightGBM's own native Dataset construction (`__init_from_np2d` /
+   `construct`) raised `bad allocation` -- a crash inside the library's internal
+   histogram-binning memory, unrelated to X/y's own size. Traced to genuinely holding
+   too much alive at once: the full mixed-dtype features dataframe (with string id/
+   country columns) was staying alive in memory for the entire GroupKFold loop, on top
+   of X/y and each fold's training slice. Split `model.train_oof` into
+   `build_xy(df, ...)` (extract contiguous float32 X/y/groups) + `train_oof(X, y,
+   groups, ...)` (no longer takes a dataframe at all) specifically so callers can `del`
+   the original dataframe before training starts. Also added `max_bin=63` +
+   `two_round=True` to LightGBM's params as an additional laptop-memory compromise.
+
+### User call: stop patching local memory, move all real runs to Kaggle
+After the second crash mid-training, explicit direction: Kaggle is set up and verified
+(31GB RAM, 4 CPUs, repo cloned, dependencies installed). New split, going forward:
+- **Local** = dev-only. Small smoke tests (e.g. ~2-20k pairs) to check code runs end to
+  end after a change. No full-size training or inference locally anymore.
+- **Kaggle** = every real run: feature build, training, test blocking + inference,
+  writing both output TSVs.
+
+Killed the running local training process (`Stop-Process`) rather than let it keep
+fighting for memory. Reverted the laptop-only compromises now that Kaggle is the real
+target: LightGBM `max_bin` back to the library default (255, was 63), `n_jobs` back to
+a real thread count (4, was 1), `two_round` off (was `True`). All three (plus DuckDB's
+memory/thread settings) are now `config.py` values read from `AML_LGBM_*`/
+`AML_DUCKDB_*` env vars -- configurable, with Kaggle-appropriate values as the defaults
+everywhere, not just on Kaggle.
+
+### `scripts/run_pipeline.py` finished as the one real end-to-end command
+Extended from 6 stages to 10, adding the validation-slice OOF report as an explicit
+stage sequence rather than a separate workflow: `normalize -> val_slice -> val_blocking
+-> val_features -> val_train -> train_features -> train -> test_features -> predict ->
+write`. `val_train` (thin wrapper around the already-tested
+`phase4_train_and_decide.run()`) is the headline number -- macro F0.5/precision/recall/
+singleton accuracy, overall and per country, printed in a clearly-delimited block
+(`_print_metrics_report`) so it's easy to spot in a long Kaggle log; `train` (fits the
+model actually used for test inference, on the FULL train set) prints the same
+breakdown as a sanity check against `val_train`. Extended
+`evaluate.per_group_macro_f_beta` to also return per-group precision/recall (was
+f_beta-only) so both stages get the full per-country breakdown from one already-
+tested, single-source-of-truth function. Every stage now logs a timestamped start/end
+line with peak RSS (polled via `psutil` on a background thread every 2s -- there's no
+one cross-platform "peak memory" syscall that works identically on Windows and
+Kaggle's Linux).
+
+### Smoke-tested every stage (per the new local=dev-only rule)
+- `normalize`/`train_features`/`train`/`test_features`/`predict`/`write`: against a
+  tiny hand-built synthetic train/test dataset (6 train S1s incl. one true singleton,
+  4 test S1s incl. a France-only row with zero training presence) -- all six passed,
+  validator `PASS`.
+- `val_slice`/`val_blocking`/`val_features`/`val_train`: these need real geographic
+  diversity for `build_validation_split.py`'s bucket selection to find anything (it
+  errored with an empty-bucket-list exception on the synthetic data), so smoke-tested
+  against the REAL local `dataset/train/` instead, with `--val-target-total 2000` (not
+  the real 45000) and a throwaway `--work-dir` so the real 45,036-entity slice built
+  earlier today wasn't overwritten. **First real numeric Phase 4 result** (small
+  sample, 2,032 eval entities, so a noisier read than the full run will give, but a
+  genuine end-to-end number): macro F0.5 **0.9295**, micro precision 0.9830 / recall
+  0.8516, singleton accuracy 0.9649; by country -- India F0.5 0.9077 (precision 0.9833,
+  recall 0.8079), US F0.5 0.9440 (precision 0.9827, recall 0.8804). Policy chosen:
+  `global_threshold(t=0.75)`.
+
+### Also: removed challenge PDFs/image from git tracking
+`guidelines.pdf`, the problem-statement PDF, and `image.png` were committed earlier
+today (before the "never push challenge data" rule was interpreted narrowly as just
+`dataset/`/`*.tsv`). Ran `git rm --cached` on all three and added `*.pdf`/`*.png` to
+`.gitignore` -- they still exist locally, just untracked now.
+
+### Kaggle time estimate (extrapolated, not measured at full scale -- flagged as such to the user)
+`normalize`/`val_slice`/`val_blocking`/`val_features`/`val_train` are all measured-ish
+(scaled from today's real ~45k-entity slice runs): rough order of 3+4+9+20+10 ≈ 45
+minutes combined. `train_features` and `test_features` block+featurize the FULL train/
+test sets -- test alone measured at 5.8x the validation slice's S1 count -- so they
+dominate and are the least certain part of the estimate: plausibly 1-3 hours *each*.
+Total for `--stage all`: rough order of a few hours, likely fitting one Kaggle session
+but not by a wide margin. Told the user this explicitly rather than a false-precise
+number, and that `--stage <name>` resumes if a session times out mid-run.
+
+### Next
+Hand off to Kaggle for the real run. Once it completes: read back the val_train OOF
+report (the real one, at 45k scale) and the final matching_results.tsv/
+candidate_pairs.tsv, run the validator, and get the first real submission out.

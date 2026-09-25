@@ -26,16 +26,19 @@ on Kaggle:
 
 | Variable | Flag | Local default | Kaggle value |
 |---|---|---|---|
-| `AML_DATA_DIR` | `--data-dir` | `dataset/` (this repo) | `/kaggle/input/<dataset-name>/dataset` |
-| `AML_WORK_DIR` | `--work-dir` | `D:/amazon_ml_work` if `D:` exists, else `.work/` | `/kaggle/temp/amazon_ml_work` |
+| `AML_DATA_DIR` | `--data-dir` | `dataset/` (this repo) | `/kaggle/input/datasets/<user>/<dataset-name>/dataset` |
+| `AML_WORK_DIR` | `--work-dir` | `D:/amazon_ml_work` if `D:` exists, else `.work/` | `/tmp/work` |
 | `AML_OUTPUT_DIR` | `--output-dir` | `output/` (this repo) | `/kaggle/working/output` |
-| `AML_DUCKDB_MEMORY_LIMIT` | `--duckdb-memory` | `3GB` (was lowered to `1GB` locally during a real-memory crisis -- see PROJECT_LOG.md) | `20GB`+ (Kaggle gives ~30GB RAM) |
-| `AML_DUCKDB_THREADS` | `--duckdb-threads` | `2` | `4` |
+| `AML_DUCKDB_MEMORY_LIMIT` | `--duckdb-memory` | `20GB` (Kaggle-sized default; local runs are tiny smoke tests, so the actual usage stays far under this regardless) | `20GB` (Kaggle gives ~31GB RAM) |
+| `AML_DUCKDB_THREADS` | `--duckdb-threads` | `4` | `4` |
+| `AML_LGBM_THREADS` | `--lgbm-threads` | `4` | `4` |
+| `AML_LGBM_MAX_BIN` | `--lgbm-max-bin` | `255` (LightGBM's own default) | `255` |
+| `AML_LGBM_TWO_ROUND` | `--lgbm-two-round` | `false` | `false` |
 
 `AML_WORK_DIR` holds intermediate artifacts (DuckDB database, parquet files) that are
 never committed (see `.gitignore`) and never need to survive between runs; on Kaggle,
-point it at `/kaggle/temp` (fast local scratch, doesn't count against output size
-limits), not `/kaggle/working`.
+point it at `/tmp` or `/kaggle/temp` (fast local scratch, doesn't count against output
+size limits), not `/kaggle/working`.
 
 Setting any of these directly (running an individual `scripts/phaseN_*.py` rather than
 `run_pipeline.py`) still works the same way:
@@ -48,53 +51,80 @@ export AML_WORK_DIR=/some/other/path     # bash
 
 ## Pipeline stages
 
-### Validation harness (local, on a held-out slice of train)
+**As of 2026-09-25: local is dev-only.** Repeated real OOMs on this 8GB machine, even
+after several rounds of memory-safety fixes (see PROJECT_LOG.md), led to a hard split:
 
-Run as modules from this directory (`code/business_entity_resolution/`), one process
-per stage -- each stage loads only what it needs and exits, which keeps peak memory
-predictable on an 8GB dev machine (DuckDB, used for anything touching a full source
-file, streams off disk rather than materializing everything in RAM). These stages
-build and score a held-out slice of `dataset/train/`, never touch `dataset/test/`, and
-exist purely to measure/tune before spending a real submission.
+- **Local** -- `scripts/run_pipeline.py`'s individual stages, run with a small
+  `--val-target-total` and/or against a tiny hand-built sample dataset, purely to check
+  the code runs end to end after a change. No full-size train/test-scale run locally.
+- **Kaggle** (31GB RAM, 4 CPUs) -- every real run: the full validation-slice OOF
+  report, full-train model fit, full-test blocking + inference, writing both output
+  TSVs. See "Kaggle: the real run" below.
 
-| # | Command | Status |
-|---|---|---|
-| 1 | `python -m scripts.build_validation_split --target-total 45000` | done |
-| 2 | `python -m scripts.phase2_normalization_report` then `python -m scripts.build_translit_token_map` | done |
-| 3 | `python -m scripts.phase3_blocking_report` | done (recall ceiling 79.98% uncapped / 79.07% capped -- see PROJECT_LOG.md) |
-| 4 | `python -m scripts.phase4_build_features` then `python -m scripts.phase4_train_and_decide` | in progress |
+### `scripts/run_pipeline.py` -- the one command, all stages
 
-Run unit tests:
+Single entry point, driven entirely by CLI flags / `AML_*` env vars (see "Paths: local
+vs. Kaggle" above) -- the same code runs locally and on Kaggle. Every stage writes its
+output to disk before the next starts, so `--stage <name>` resumes after a crash
+without redoing earlier stages, and logs a timestamped start/end line with peak RSS
+(via `psutil`) for each stage.
+
+| Stage | What it does |
+|---|---|
+| `normalize` | learn suffix tokens + transliteration token map from the FULL train+test data |
+| `val_slice` | build the held-out validation slice from `dataset/train/` (`--val-target-total`, default 45000) |
+| `val_blocking` | block + cap candidates on that slice, report recall |
+| `val_features` | build labeled features for the slice |
+| `val_train` | GroupKFold LightGBM OOF training + decision layer on the slice -- **prints macro F0.5/precision/recall/singleton accuracy, overall and per country: the headline validation number** |
+| `train_features` | block + build labeled features for the FULL `train_source1` vs `train_source2/3` |
+| `train` | fit the model actually used for test inference (GroupKFold LightGBM on the full train set); also prints its own OOF numbers as a sanity check against `val_train` |
+| `test_features` | block + build UNlabeled features for the FULL `test_source1` vs `test_source2/3` |
+| `predict` | score test features with the saved models; decision layer (no ground truth) |
+| `write` | write `output/matching_results.tsv` + `candidate_pairs.tsv`, run `utils/validate_submission.py`, archive a versioned copy |
+
+`--stage all` (the default) runs every stage above in that order.
+
+### Local smoke test (dev only)
 
 ```
-python -m unittest discover -s tests -v
+python -m scripts.run_pipeline --val-target-total 2000 --stage normalize
+python -m scripts.run_pipeline --val-target-total 2000 --stage val_slice
+python -m scripts.run_pipeline --val-target-total 2000 --stage val_blocking
+python -m scripts.run_pipeline --val-target-total 2000 --stage val_features
+python -m scripts.run_pipeline --val-target-total 2000 --stage val_train
 ```
 
-### Real end-to-end run (`scripts/run_pipeline.py`) -> submission files
+`val_slice`/`val_blocking`/`val_features`/`val_train` need real data with some
+geographic diversity to build buckets (`build_validation_split.py`'s bucket selection),
+so use the real `dataset/train/` with a small `--val-target-total` rather than a fully
+synthetic sample for those four. `normalize`/`train_features`/`train`/`test_features`/
+`predict`/`write` have no such requirement and can run against a tiny hand-built
+sample dataset (`--data-dir` pointed at a folder with the same train/test TSV schema).
 
-This is the single entry point that actually produces `output/matching_results.tsv` +
-`output/candidate_pairs.tsv`: normalize -> block -> build features -> train (GroupKFold
-LightGBM on the FULL train set) -> predict (score `dataset/test/`, no ground truth,
-decision layer only) -> write + validate + archive. Every stage writes its output to
-disk before the next starts, so `--stage <name>` resumes after a crash without redoing
-earlier stages.
-
-Local:
-
-```
-python -m scripts.run_pipeline
-```
-
-Kaggle (Windows or Linux notebook; adjust `<dataset-name>` to whatever the competition
-dataset is mounted as under `/kaggle/input/`):
+### Kaggle: the real run
 
 ```
 python -m scripts.run_pipeline \
-    --data-dir /kaggle/input/<dataset-name>/dataset \
-    --work-dir /kaggle/temp/amazon_ml_work \
+    --data-dir /kaggle/input/datasets/<username>/<dataset-name>/dataset \
+    --work-dir /tmp/work \
     --output-dir /kaggle/working/output \
     --duckdb-memory 20GB --duckdb-threads 4
 ```
+
+(`--lgbm-threads`/`--lgbm-max-bin`/`--lgbm-two-round` also exist if LightGBM ever needs
+tuning on Kaggle, but the defaults are already the real values -- `n_jobs=4`,
+`max_bin=255`, `two_round=False` -- not the laptop-memory compromises from earlier
+today.)
+
+**Rough time estimate** (extrapolated from local measurements at smaller scale, not
+measured at full size -- treat as an estimate, not a promise): `normalize` ~3min,
+`val_slice` ~4min, `val_blocking` ~9min, `val_features` ~20min, `val_train` ~10min are
+all measured-ish (scaled from the ~45k-entity validation slice). `train_features` and
+`test_features` block+featurize the FULL train/test sets (test alone is ~5.8x the
+validation slice's entity count), so they dominate the runtime and are the least
+certain estimate -- plausibly **1-3 hours each**. Total for `--stage all`: **rough
+order of a few hours**, likely fitting a single Kaggle session but not by a wide
+margin. If it doesn't fit, `--stage <name>` resumes from wherever it stopped.
 
 Resume just one stage (e.g. after fixing a bug found in `predict`):
 
@@ -106,6 +136,12 @@ python -m scripts.run_pipeline --stage write
 After `write`, check the printed `utils/validate_submission.py` result -- `PASS` means
 safe to submit; a versioned copy of the two output files (+ the train report) is also
 archived under `submissions/<timestamp>/` (gitignored, kept for local history only).
+
+Run unit tests:
+
+```
+python -m unittest discover -s tests -v
+```
 
 ## Module map (`src/`)
 

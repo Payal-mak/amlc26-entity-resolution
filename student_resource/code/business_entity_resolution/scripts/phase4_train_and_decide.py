@@ -16,6 +16,7 @@ Usage (from code/business_entity_resolution/):
 # it conflicts with.
 import lightgbm  # noqa: F401,E402
 
+import gc
 import json
 import sys
 import time
@@ -33,7 +34,10 @@ PHASE4_DIR = config.PARQUET_DIR / "phase4"
 
 def load_features() -> pd.DataFrame:
     frames = [pd.read_parquet(p) for p in sorted(PHASE4_DIR.glob("features_*.parquet"))]
-    return pd.concat(frames, ignore_index=True)
+    df = pd.concat(frames, ignore_index=True)
+    del frames
+    gc.collect()
+    return df
 
 
 def load_eval_ids_and_truth_and_country() -> tuple:
@@ -51,23 +55,35 @@ def load_eval_ids_and_truth_and_country() -> tuple:
 def run() -> dict:
     t0 = time.time()
     df = load_features()
-    print(f"loaded features: {len(df)} rows, {df['label'].sum()} positives ({time.time()-t0:.1f}s)")
+    n_rows, n_positives = len(df), int(df["label"].sum())
+    print(f"loaded features: {n_rows} rows, {n_positives} positives ({time.time()-t0:.1f}s)")
 
     eval_ids, truths, s1_country = load_eval_ids_and_truth_and_country()
 
-    oof_proba, models, fold_id = model.train_oof(df, features.FEATURE_COLUMNS, n_folds=5, seed=config.RANDOM_SEED)
-    df["proba"] = oof_proba
+    X, y, groups = model.build_xy(df, features.FEATURE_COLUMNS)
+    s1_ids, cand_ids = df["s1_id"].values, df["cand_id"].values
+    # Free the full mixed-dtype features dataframe (feature columns + string
+    # ids) BEFORE training starts, not after -- holding both it and X/y alive
+    # for the whole GroupKFold loop was real, measured peak-memory waste that
+    # contributed to a `bad allocation` crash inside LightGBM's own native
+    # Dataset construction at ~11.6M rows (see PROJECT_LOG.md).
+    del df
+    gc.collect()
+
+    oof_proba, models, fold_id = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
     print(f"trained 5-fold GroupKFold LightGBM ({time.time()-t0:.1f}s)")
-
     importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
+    del X, y, groups
+    gc.collect()
 
+    df = pd.DataFrame({"s1_id": s1_ids, "cand_id": cand_ids, "proba": oof_proba})
     preds, policy = decide.decide(df, eval_ids, truths=truths)
     print(f"decision policy selected: {policy} ({time.time()-t0:.1f}s)")
 
     report = evaluate.score_report(preds, truths, group_of=s1_country)
     report["policy"] = policy
-    report["n_train_rows"] = len(df)
-    report["n_positives"] = int(df["label"].sum())
+    report["n_train_rows"] = n_rows
+    report["n_positives"] = n_positives
     report["build_time_seconds"] = round(time.time() - t0, 1)
     report["top_features"] = importance.head(15).values.tolist()
 
