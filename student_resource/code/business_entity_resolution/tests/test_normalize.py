@@ -91,6 +91,48 @@ class TestDevanagari(unittest.TestCase):
         self.assertIn("marketing", full.split())
 
 
+class TestOtherIndicScripts(unittest.TestCase):
+    """recall-v2: has_indic_script/transliterate_indic generalize the
+    Devanagari-only bridge to every script indic_transliteration supports.
+    """
+
+    def test_detect_tamil(self):
+        self.assertEqual(normalize.detect_indic_script("தமிழ்"), "TAMIL")
+
+    def test_detect_gujarati(self):
+        self.assertEqual(normalize.detect_indic_script("ગુજરાતી"), "GUJARATI")
+
+    def test_detect_devanagari_still_works(self):
+        self.assertEqual(normalize.detect_indic_script("राम मार्केटिंग"), "DEVANAGARI")
+
+    def test_detect_latin_is_none(self):
+        self.assertIsNone(normalize.detect_indic_script("Ram Marketing Private Limited"))
+
+    def test_has_indic_script_true_for_non_devanagari(self):
+        self.assertTrue(normalize.has_indic_script("தமிழ் நிறுவனம்"))
+
+    def test_transliterate_indic_tamil_nonempty(self):
+        # Not asserting pure-ASCII here: indic_transliteration's Tamil->ITRANS
+        # coverage has a gap (observed: alveolar 'ன' passes through
+        # untransliterated) -- harmless for the real pipeline since
+        # normalize_full's basic_clean step strips whatever's left (see
+        # test_normalize_full_never_empty_for_tamil below), same as any other
+        # non a-z0-9 character.
+        out = normalize.transliterate_indic("தமிழ் நிறுவனம்")
+        self.assertTrue(len(out) > 0)
+
+    def test_transliterate_indic_passthrough_for_latin(self):
+        self.assertEqual(normalize.transliterate_indic("Ram Marketing"), "Ram Marketing")
+
+    def test_normalize_full_never_empty_for_tamil(self):
+        # Same regression class as the Devanagari test above, generalized:
+        # basic_clean's a-z0-9 filter would silently produce "" for any
+        # untransliterated Indic script.
+        full = normalize.normalize_full("தமிழ் நிறுவனம்")
+        self.assertNotEqual(full, "")
+        self.assertTrue(all(ord(c) < 128 for c in full))
+
+
 if __name__ == "__main__":
     unittest.main()
 

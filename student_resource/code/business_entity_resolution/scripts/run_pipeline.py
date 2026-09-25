@@ -79,6 +79,7 @@ import gc
 import json
 import os
 import pickle
+import shutil
 import sys
 import threading
 import time
@@ -102,18 +103,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lgbm-two-round", action="store_true", help="Force LightGBM two_round=True (off by default; a laptop-memory compromise, not needed on Kaggle). Env: AML_LGBM_TWO_ROUND")
     p.add_argument("--two-stage", action="store_true", help="Use the two-stage model (stage 2 re-scores with context features rebuilt from stage-1 OOF probabilities; off by default). Env: AML_TWO_STAGE")
     p.add_argument(
-        "--train-source", default="full", choices=["full", "val"],
-        help="Data the FINAL model (the `train` stage) is fit on. 'full' (default) = every train pair from the "
-             "train_features stage (~100M rows on the real data: does not fit in 30GB of RAM). 'val' = the "
-             "validation-slice features already built by val_features (EVAL+CONTEXT, ~12M rows at the default "
-             "--val-target-total); with 'val', `--stage all` skips train_features.",
-    )
-    p.add_argument(
         "--sample", default=0, type=int, metavar="N",
         help="LOCAL CRASH TESTING ONLY (off by default): swap the data dir for a generated sample of ~N Source-1 "
              "rows per split (scripts/make_sample_dataset.py) for every stage run in this invocation. Do not use "
              "with val_slice/val_blocking (they need real geographic diversity) and never for a real run.",
     )
+    p.add_argument("--disable-tfidf-block", action="store_true", help="Turn off src.blocking's char-3-gram TF-IDF block (on by default -- recall-v2). Its full-country-scale cost was never run locally (sparse matmul, not an indexed SQL join); use this if it's too slow/memory-heavy on the first Kaggle run. Env: AML_ENABLE_TFIDF_BLOCK")
+    p.add_argument("--geo-max-cand-token-df", default=None, type=int, help="B_geo candidate-side token document-frequency cap (3000 default -- untuned safety margin after a real full-train-scale OOM in block_b_geo, see PROJECT_LOG.md). Env: AML_GEO_MAX_CAND_TOKEN_DF")
+    p.add_argument("--s1-batch-size", default=None, type=int, help="Batch S1 within each country into groups of this size before blocking (100000 default) -- bounds every block's join input regardless of country size. Env: AML_S1_BATCH_SIZE")
+    p.add_argument("--duckdb-max-temp-dir-size", default=None, help="DuckDB max_temp_directory_size (200GB default -- a soft cap independent of real free disk space; a real Kaggle crash hit the old 30GB default with 1TB+ actually free). Env: AML_DUCKDB_MAX_TEMP_DIRECTORY_SIZE")
+    p.add_argument("--ckpt-dir", default=None, help="Persistent checkpoint dir (e.g. /kaggle/working/ckpt) that survives a Kaggle SESSION restart, unlike --work-dir. Completed train/test feature+candidate batches and the trained model are mirrored here and restored from here if missing from --work-dir. Omit to disable checkpointing. Env: AML_CKPT_DIR")
+    p.add_argument("--skip-full-train", action="store_true", help="Skip train_features/train entirely and predict test with the val_train (validation-slice) model instead -- for a fast first submission. Only affects --stage all's stage list.")
     p.add_argument("--val-target-total", default=45000, type=int, help="Validation-slice size (scripts/build_validation_split.py). Use a small value (e.g. 2000) for a local smoke test.")
     p.add_argument(
         "--stage", default="all",
@@ -150,6 +150,16 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ["AML_LGBM_TWO_ROUND"] = "true"
     if args.two_stage:
         os.environ["AML_TWO_STAGE"] = "true"
+    if args.disable_tfidf_block:
+        os.environ["AML_ENABLE_TFIDF_BLOCK"] = "false"
+    if args.geo_max_cand_token_df:
+        os.environ["AML_GEO_MAX_CAND_TOKEN_DF"] = str(args.geo_max_cand_token_df)
+    if args.s1_batch_size:
+        os.environ["AML_S1_BATCH_SIZE"] = str(args.s1_batch_size)
+    if args.duckdb_max_temp_dir_size:
+        os.environ["AML_DUCKDB_MAX_TEMP_DIRECTORY_SIZE"] = args.duckdb_max_temp_dir_size
+    if args.ckpt_dir:
+        os.environ["AML_CKPT_DIR"] = args.ckpt_dir
     if args.sample:
         _use_sample_dataset(args)
 
@@ -207,6 +217,40 @@ def _rss_mb():
     if psutil is None:
         return None
     return psutil.Process().memory_info().rss / (1024 * 1024)
+
+
+def _ckpt_restore(path: Path) -> bool:
+    """If `path` (must be under config.WORK_DIR) is missing but a copy
+    exists under config.CKPT_DIR, restore it. Returns True if `path` exists
+    afterward either way (already there, or just restored), False if it's
+    genuinely missing and there's nothing to restore from.
+
+    This is what makes --ckpt-dir useful across a Kaggle SESSION restart
+    (which wipes --work-dir, typically /tmp/...) rather than just within one
+    session (where --work-dir survives on its own and this is a no-op).
+    """
+    if path.exists():
+        return True
+    if not config.CKPT_DIR:
+        return False
+    src = Path(config.CKPT_DIR) / path.relative_to(config.WORK_DIR)
+    if not src.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, path)
+    return True
+
+
+def _ckpt_save(path: Path) -> None:
+    """Mirror `path` (must be under config.WORK_DIR) into config.CKPT_DIR,
+    if checkpointing is enabled and the file actually exists. No-op
+    otherwise (e.g. locally, where --ckpt-dir is never set).
+    """
+    if not config.CKPT_DIR or not path.exists():
+        return
+    dest = Path(config.CKPT_DIR) / path.relative_to(config.WORK_DIR)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, dest)
 
 
 def _reset_duckdb() -> None:
@@ -319,6 +363,23 @@ def stage_val_train() -> dict:
     print("[val_train] GroupKFold LightGBM OOF training + decision layer on the validation slice...", flush=True)
     report = phase4_train_and_decide.run()
     _print_metrics_report(report, "VALIDATION-SLICE OOF RESULTS (scripts/phase4_train_and_decide.py)")
+
+    if _args.skip_full_train:
+        # --skip-full-train: this IS the model stage_predict will use, since
+        # train_features/train never run. phase4_train_and_decide.run()
+        # already pickled its fold models to VAL_MODEL_PATH; copy that to
+        # the exact path stage_predict/stage_train would have written, and
+        # write this report where stage_write expects TRAIN_REPORT_PATH.
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(phase4_train_and_decide.VAL_MODEL_PATH, MODEL_PATH)
+        PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(TRAIN_REPORT_PATH, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str, ensure_ascii=False)
+        _save_feature_columns()
+        _ckpt_save(MODEL_PATH)
+        _ckpt_save(FEATURE_COLUMNS_PATH)
+        _ckpt_save(TRAIN_REPORT_PATH)
+        print("[val_train] --skip-full-train: saved the validation-slice model as the model predict/write will use", flush=True)
     return report
 
 
@@ -327,12 +388,24 @@ def build_country_pairs_and_features(
     label_map: dict = None, cand_out_dir: Path = None,
 ) -> None:
     """Shared block + feature-build loop for both train (labeled) and test
-    (unlabeled) data, one country at a time -- so peak memory is bounded by
-    one country's data, not the full multi-country pool (the fix for three
-    separate OOM crashes in Phase 3; see PROJECT_LOG.md).
+    (unlabeled) data, one country at a time, and within each country, one
+    S1 BATCH at a time (config.S1_BATCH_SIZE, default 100k) -- so every
+    block's join input is bounded by (one batch of S1) x (the full candidate
+    pool), never (an entire country's S1, e.g. 883k for India) x (the full
+    candidate pool) at once. Added after a real Kaggle crash: block_b_geo
+    OOM'd at full India train scale (883k S1 / 4.1M candidates) even though
+    the same code ran fine on the ~5x-smaller validation slice -- see
+    PROJECT_LOG.md and config.GEO_MAX_CAND_TOKEN_DF's docstring for the other
+    half of that fix (a candidate-side DF cap block_b_geo didn't have before).
+
+    Each batch's outputs are also checkpoint-aware (config.CKPT_DIR, set via
+    --ckpt-dir): if a batch's output files already exist (in --work-dir, or
+    restored from --ckpt-dir after a Kaggle session restart wiped
+    --work-dir), that batch is skipped entirely rather than recomputed --
+    the resume story for a mid-run crash on a later country/batch.
 
     Inputs: registered view names for S1/S2/S3 (already VARCHAR-typed CSV
-    views over the raw TSVs), output dir for features_{country}.parquet,
+    views over the raw TSVs), output dir for features_{country}_{batch}.parquet,
     optional {s1_id: set(true_cand_id)} label map (omit entirely for test --
     no ground truth exists there), optional dir to also persist the raw
     capped candidate pairs (needed for test, to build candidate_pairs.tsv;
@@ -367,25 +440,47 @@ def build_country_pairs_and_features(
         s3_c = load_country_frame(con, s3_view, country, suffix_sets, translit_map)
         cand_c = pd.concat([s2_c, s3_c], ignore_index=True)
         del s2_c, s3_c
-
-        # Same three steps as blocking.block_and_cap_country, but the capped pairs are
-        # written to parquet BY DUCKDB instead of being fetched into a pandas frame first:
-        # at full scale one country is 40M+ pairs (several GB of Python strings).
-        block_views = blocking.run_all_blocks(con, s1_c, cand_c)
-        capped_view = blocking.cap_candidates(con, blocking.union_and_score(con, block_views))
-        pairs_path = out_dir / f"_capped_{country}.parquet"
-        io_utils.export_parquet(con, f"SELECT * FROM {capped_view}", pairs_path)
-        if cand_out_dir is not None:
-            io_utils.export_parquet(con, f"SELECT s1_id, cand_id FROM {capped_view}", cand_out_dir / f"capped_{country}.parquet")
         con.close()
 
-        feat_out = out_dir / f"features_{country}.parquet"
-        n_rows, n_pos = features.build_country_features(pairs_path, s1_c, cand_c, feat_out, label_map, country)
-        pairs_path.unlink(missing_ok=True)
-        print(
-            f"  country={country}: s1={len(s1_c)} cand={len(cand_c)} pairs={n_rows} "
-            f"positives={n_pos} ({time.time()-tc:.1f}s)", flush=True,
-        )
+        n_batches = max(1, -(-len(s1_c) // config.S1_BATCH_SIZE))  # ceil div
+        print(f"  country={country}: s1={len(s1_c)} cand={len(cand_c)} -> {n_batches} batch(es) of <= {config.S1_BATCH_SIZE}", flush=True)
+
+        for batch_idx in range(n_batches):
+            tb = time.time()
+            feat_out = out_dir / f"features_{country}_{batch_idx:03d}.parquet"
+            cand_batch_path = cand_out_dir / f"capped_{country}_{batch_idx:03d}.parquet" if cand_out_dir is not None else None
+
+            if _ckpt_restore(feat_out) and (cand_batch_path is None or _ckpt_restore(cand_batch_path)):
+                print(f"    country={country} batch={batch_idx}/{n_batches-1}: already done (checkpoint), skipping", flush=True)
+                continue
+
+            s1_batch = s1_c.iloc[batch_idx * config.S1_BATCH_SIZE : (batch_idx + 1) * config.S1_BATCH_SIZE]
+
+            _reset_duckdb()
+            con = io_utils.get_connection()
+            blocking.register_suffix_table(con, suffix_sets)
+            capped_df, _ = blocking.block_and_cap_country(con, s1_batch, cand_c)
+            con.close()
+            _reset_duckdb()
+
+            pairs_path = out_dir / f"_capped_{country}_{batch_idx:03d}.parquet"
+            capped_df.to_parquet(pairs_path, index=False)
+            if cand_batch_path is not None:
+                capped_df[["s1_id", "cand_id"]].to_parquet(cand_batch_path, index=False)
+                _ckpt_save(cand_batch_path)
+
+            n_rows, n_pos = features.build_country_features(pairs_path, s1_batch, cand_c, feat_out, label_map, country)
+            pairs_path.unlink(missing_ok=True)
+            _ckpt_save(feat_out)
+            print(
+                f"    country={country} batch={batch_idx}/{n_batches-1}: s1={len(s1_batch)} "
+                f"pairs={n_rows} positives={n_pos} capped_pairs={len(capped_df)} ({time.time()-tb:.1f}s)",
+                flush=True,
+            )
+            del s1_batch, capped_df
+            gc.collect()
+
+        print(f"  country={country}: done ({time.time()-tc:.1f}s)", flush=True)
         del s1_c, cand_c
         gc.collect()
     _reset_duckdb()
@@ -429,33 +524,26 @@ def _check_feature_columns() -> None:
 
 
 def stage_train() -> dict:
-    """Fit the model actually used for test inference. Also reports its own OOF
-    numbers as a sanity check.
+    """Fit the model actually used for test inference, on the FULL train set (every
+    pair from `train_features`). Also reports its own OOF numbers as a sanity check
+    against val_train's headline result.
 
-    --train-source full (default): every pair from `train_features` (the FULL train
-    set). --train-source val: the validation-slice features from `val_features`
-    (EVAL+CONTEXT design, realistic decoy density) -- what a 30GB machine can
-    actually hold; see the flag's help text.
+    NOT viable on a 30GB machine with the real data (~100M pairs x ~46 features):
+    run with --skip-full-train instead, which predicts test with the validation-slice
+    model (see README.md, "Scale").
     """
-    if _args.train_source == "val":
-        print("[train] --train-source val: loading the validation-slice features...", flush=True)
-        frames = [pd.read_parquet(p) for p in sorted(phase4_train_and_decide.PHASE4_DIR.glob("features_*.parquet"))]
-        if not frames:
-            raise RuntimeError("no validation-slice features found -- run the val_features stage first")
-        eval_ids, truths, s1_country = phase4_train_and_decide.load_eval_ids_and_truth_and_country()
-    else:
-        print("[train] loading full-train features...", flush=True)
-        frames = [pd.read_parquet(p) for p in sorted(TRAIN_FEATURES_DIR.glob("features_*.parquet"))]
-        _reset_duckdb()
-        con = io_utils.get_connection()
-        io_utils.register_all_standard_views(con)
-        full_gt = load_ground_truth_map(con)
-        s1_country = dict(con.execute("SELECT entity_id, country FROM train_source1").fetchall())
-        con.close()
-        # Every train S1 must be scored, including ones blocking found zero candidates for
-        # (they still count in macro F0.5) -- not just the subset that appears in df.
-        eval_ids = set(s1_country.keys())
-        truths = {sid: full_gt.get(sid, set()) for sid in eval_ids}
+    print("[train] loading full-train features...", flush=True)
+    frames = [pd.read_parquet(p) for p in sorted(TRAIN_FEATURES_DIR.glob("features_*.parquet"))]
+    _reset_duckdb()
+    con = io_utils.get_connection()
+    io_utils.register_all_standard_views(con)
+    full_gt = load_ground_truth_map(con)
+    s1_country = dict(con.execute("SELECT entity_id, country FROM train_source1").fetchall())
+    con.close()
+    # Every train S1 must be scored, including ones blocking found zero candidates for
+    # (they still count in macro F0.5) -- not just the subset that appears in df.
+    eval_ids = set(s1_country.keys())
+    truths = {sid: full_gt.get(sid, set()) for sid in eval_ids}
     df = pd.concat(frames, ignore_index=True)
     del frames
     n_rows, n_positives = len(df), int(df["label"].sum())
@@ -488,13 +576,12 @@ def stage_train() -> dict:
 
     report = evaluate.score_report(preds, truths, group_of=s1_country)
     report["policy"] = policy
-    report["train_source"] = _args.train_source
     report["two_stage"] = config.TWO_STAGE
     report["n_train_rows"] = n_rows
     report["n_positives"] = n_positives
     report["n_eval_ids"] = len(eval_ids)
     report["top_features"] = importance.head(15).values.tolist()
-    _print_metrics_report(report, "TRAIN-STAGE OOF RESULTS (--train-source %s)" % _args.train_source)
+    _print_metrics_report(report, "FULL-TRAIN OOF RESULTS (sanity check against val_train above)")
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
@@ -504,6 +591,9 @@ def stage_train() -> dict:
     PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
     with open(TRAIN_REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str, ensure_ascii=False)
+    _ckpt_save(MODEL_PATH)
+    _ckpt_save(FEATURE_COLUMNS_PATH)
+    _ckpt_save(TRAIN_REPORT_PATH)
     return report
 
 
@@ -542,8 +632,24 @@ def _score_country(models, path: Path) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def _feature_files_by_country(features_dir: Path) -> dict:
+    """{country: [feature parquet files]}. build_country_pairs_and_features writes
+    features_{country}_{batch:03d}.parquet (older runs: features_{country}.parquet).
+    All batches of a country are decided together: one-to-one assignment and the
+    per-S1 decision need every candidate of that country."""
+    by_country = {}
+    for p in sorted(features_dir.glob("features_*.parquet")):
+        stem = p.stem[len("features_"):]
+        head, _, tail = stem.rpartition("_")
+        country = head if head and tail.isdigit() else stem
+        by_country.setdefault(country, []).append(p)
+    return by_country
+
+
 def stage_predict() -> dict:
     print("[predict] loading trained models...", flush=True)
+    _ckpt_restore(MODEL_PATH)  # e.g. --skip-full-train's val model, after a session restart wiped --work-dir
+    _ckpt_restore(FEATURE_COLUMNS_PATH)
     _check_feature_columns()
     with open(MODEL_PATH, "rb") as f:
         models = pickle.load(f)
@@ -562,10 +668,9 @@ def stage_predict() -> dict:
     # country's (pruned) scored pairs instead of the whole test set.
     preds = {}
     policy = "expected_f_beta_subset_selection"
-    for path in sorted(TEST_FEATURES_DIR.glob("features_*.parquet")):
-        country = path.stem[len("features_"):]
+    for country, paths in _feature_files_by_country(TEST_FEATURES_DIR).items():
         t0 = time.time()
-        scored = _score_country(models, path)
+        scored = pd.concat([_score_country(models, p) for p in paths], ignore_index=True)
         ids = ids_by_country.get(country, set())
         # No ground truth at real inference time -> decide() always uses the
         # expected-F0.5 subset-selection policy (see src/decide.py).
@@ -616,6 +721,7 @@ def stage_write() -> None:
     code, output = write_outputs.run_validator(matching_path, candidate_path, config.TEST_DIR)
     print(output)
 
+    _ckpt_restore(TRAIN_REPORT_PATH)
     report = json.loads(TRAIN_REPORT_PATH.read_text(encoding="utf-8")) if TRAIN_REPORT_PATH.exists() else None
     dest = write_outputs.save_versioned_copy(matching_path, candidate_path, report)
     print(f"[write] validator exit code {code}; versioned copy saved to {dest}", flush=True)
@@ -681,8 +787,9 @@ def _run_stage_with_logging(name: str, fn) -> None:
 
 def main() -> None:
     stages_to_run = STAGE_ORDER if _args.stage == "all" else [_args.stage]
-    if _args.stage == "all" and _args.train_source == "val":
-        stages_to_run = [n for n in stages_to_run if n != "train_features"]  # unused when training on the val slice
+    if _args.stage == "all" and _args.skip_full_train:
+        stages_to_run = [s for s in stages_to_run if s not in ("train_features", "train")]
+        print("[main] --skip-full-train: skipping train_features/train, predicting test with the val_train model", flush=True)
     for name in stages_to_run:
         _run_stage_with_logging(name, STAGES[name])
 

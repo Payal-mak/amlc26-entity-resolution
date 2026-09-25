@@ -18,6 +18,7 @@ import lightgbm  # noqa: F401,E402
 
 import gc
 import json
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ from src import config, decide, evaluate, features, model  # noqa: E402
 
 VAL_SLICE_DIR = config.PARQUET_DIR / "val_slice"
 PHASE4_DIR = config.PARQUET_DIR / "phase4"
+VAL_MODEL_PATH = PHASE4_DIR / "val_fold_models.pkl"
 
 
 def load_features() -> pd.DataFrame:
@@ -76,12 +78,22 @@ def run() -> dict:
         )
         print(f"trained 2-stage 5-fold GroupKFold LightGBM ({time.time()-t0:.1f}s)")
         importance = info["importance"]
+        # what --skip-full-train hands to predict: stage-1/stage-2 fit on every validation-slice row
+        models = model.fit_two_stage_final(X, y, s1_ids, cand_ids, info["stage1_oof"], seed=config.RANDOM_SEED)
     else:
         oof_proba, models, fold_id = model.train_oof(X, y, groups, n_folds=5, seed=config.RANDOM_SEED)
         print(f"trained 5-fold GroupKFold LightGBM ({time.time()-t0:.1f}s)")
         importance = model.feature_importance_report(models, features.FEATURE_COLUMNS)
     del X, y, groups
     gc.collect()
+
+    # Persisted unconditionally (cheap, always useful for provenance) --
+    # scripts/run_pipeline.py's --skip-full-train copies this straight to
+    # MODEL_PATH so stage_predict can score test with the validation-slice
+    # model without ever running train_features/train (see PROJECT_LOG.md).
+    PHASE4_DIR.mkdir(parents=True, exist_ok=True)
+    with open(VAL_MODEL_PATH, "wb") as f:
+        pickle.dump(models, f)
 
     df = pd.DataFrame({"s1_id": s1_ids, "cand_id": cand_ids, "proba": oof_proba})
     preds, policy = decide.decide(df, eval_ids, truths=truths)
