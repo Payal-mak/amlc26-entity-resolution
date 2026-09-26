@@ -198,6 +198,23 @@ on the real data with `--val-target-total 2000`). Example (after the val_* stage
 `python -m scripts.run_pipeline --sample 3000 --skip-full-train --stage test_features`, then the same for
 then `predict` and `write`.
 
+**Streaming test inference (`--stage test_stream`, then `--stage merge`) -- what a real submission run uses.**
+The test set has ~94M candidate pairs; writing 46 features for all of them (~17GB) filled the Kaggle disk and one
+process could not finish in 12 hours. `--skip-full-train` with `--stage all` now ends with `test_stream -> merge`:
+- `test_stream` works per country and per S1 batch (`src/stream_test.py`): block + cap -> **rank features against ALL
+  S1 of the country** (one DuckDB pass; per-batch ranks were ~5x too small, about -0.4 F0.5 at threshold 0.60) ->
+  the 41 pairwise features on **all cores** (`features.FeatureWorkers`, output identical to the sequential build) ->
+  the saved val_train fold models -> keep only pairs with probability >= 0.005 (`pred_*.parquet`) plus each S1's
+  candidate list (`cands_*.parquet`, the rows of `candidate_pairs.tsv`). Feature data and DuckDB temp files are deleted
+  after every batch; free disk and RAM are logged after every batch.
+- `--countries France` (or `India`, `US`, `India,US`) processes only those countries, so each can run in its own
+  Kaggle notebook. `--test-cap K` keeps the top-K candidates per S1 (measured on the local slice: K=50 costs about
+  0.45 F0.5 points, K=30 about 1.3, K=20 about 3.3 -- leave it off unless time is critical).
+- `merge` reads every `pred_*` / `cands_*` file under `--merge-dirs` (default: this run's stream dir), applies one-to-one
+  over all countries, then the global threshold val_train selected (`--threshold` overrides), writes both TSVs and runs the
+  validator. `kaggle/run_pipeline_kaggle.ipynb` wires this as three roles: `MODE = "A"` (train + carry), `"COUNTRY"`, `"MERGE"`.
+  `--stage test_features/predict/write` (the old, non-streaming path) still exist.
+
 **Two-stage model (optional, off by default).** `--two-stage` (or `AML_TWO_STAGE=true`)
 adds a second LightGBM pass whose extra inputs (rank / gap / reverse-rank / count of
 candidates above 0.5) are rebuilt from stage-1 out-of-fold probabilities. `train` then

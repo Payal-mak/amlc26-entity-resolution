@@ -114,14 +114,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--duckdb-max-temp-dir-size", default=None, help="DuckDB max_temp_directory_size (200GB default -- a soft cap independent of real free disk space; a real Kaggle crash hit the old 30GB default with 1TB+ actually free). Env: AML_DUCKDB_MAX_TEMP_DIRECTORY_SIZE")
     p.add_argument("--ckpt-dir", default=None, help="Persistent checkpoint dir (e.g. /kaggle/working/ckpt) that survives a Kaggle SESSION restart, unlike --work-dir. Completed train/test feature+candidate batches and the trained model are mirrored here and restored from here if missing from --work-dir. Omit to disable checkpointing. Env: AML_CKPT_DIR")
     p.add_argument("--skip-full-train", action="store_true", help="Skip train_features/train entirely and predict test with the val_train (validation-slice) model instead -- for a fast first submission. Only affects --stage all's stage list.")
+    p.add_argument("--countries", default=None, help="test_stream only: comma-separated countries to process (e.g. France or India,US). Default: all. Lets each country run in its own Kaggle notebook.")
+    p.add_argument("--test-cap", default=None, type=int, metavar="K", help="test_stream only: keep only the top-K candidates per S1 (by name similarity, then number of blocks) -- fewer pairs to score. Default: off (the blocking cap of 75 applies).")
+    p.add_argument("--feature-workers", default=None, type=int, help="test_stream only: processes for feature building (default: all cores).")
+    p.add_argument("--s1-stream-batch", default=None, type=int, help="test_stream only: S1 per batch (default 100000, same as --s1-batch-size).")
+    p.add_argument("--merge-dirs", default=None, help="merge only: comma-separated folders holding pred_*.parquet / cands_*.parquet (searched recursively), e.g. one per country notebook. Default: this run's own stream dir.")
+    p.add_argument("--threshold", default=None, type=float, help="merge only: global probability threshold (default: the one val_train selected, from its report; if it chose the label-free policy, expected-F0.5).")
     p.add_argument("--val-target-total", default=45000, type=int, help="Validation-slice size (scripts/build_validation_split.py). Use a small value (e.g. 2000) for a local smoke test.")
     p.add_argument(
         "--stage", default="all",
         choices=[
             "all", "normalize", "val_slice", "val_blocking", "val_features", "val_train",
-            "train_features", "train", "test_features", "predict", "write",
+            "train_features", "train", "test_features", "predict", "write", "test_stream", "merge",
         ],
-        help="Run one stage only, or 'all' (default) to run every stage in order.",
+        help="Run one stage only, or 'all' (default) to run every stage in order. With --skip-full-train, 'all' ends with test_stream -> merge (streaming, small disk) instead of test_features -> predict -> write.",
     )
     return p.parse_args()
 
@@ -700,6 +706,64 @@ def stage_predict() -> dict:
     return {"preds": preds, "test_ids": test_ids, "policy": policy}
 
 
+STREAM_DIR = config.PARQUET_DIR / "stream"
+
+
+def stage_test_stream() -> None:
+    """Streaming test inference (src/stream_test.py): block -> rank features -> features -> predict with the
+    val_train fold models, per country and S1 batch; only pred_*/cands_* parquet files are kept."""
+    from src import stream_test
+
+    _ckpt_restore(MODEL_PATH)
+    _ckpt_restore(FEATURE_COLUMNS_PATH)
+    _check_feature_columns()
+    with open(MODEL_PATH, "rb") as f:
+        models = pickle.load(f)
+    suffix_sets, translit_map = load_suffix_and_translit()
+
+    _reset_duckdb()
+    con = io_utils.get_connection()
+    io_utils.register_all_standard_views(con)
+    countries = [r[0] for r in con.execute("SELECT DISTINCT country FROM test_source1 ORDER BY country").fetchall()]
+    con.close()
+    if _args.countries:
+        wanted = [c.strip().lower() for c in _args.countries.split(",") if c.strip()]
+        unknown = [w for w in wanted if w not in [c.lower() for c in countries]]
+        if unknown:
+            raise SystemExit(f"--countries {unknown} not in the test data (found {countries})")
+        countries = [c for c in countries if c.lower() in wanted]
+    batch = _args.s1_stream_batch or config.S1_BATCH_SIZE
+    print(f"[test_stream] countries={countries} batch={batch} test_cap={_args.test_cap} workers={_args.feature_workers or os.cpu_count()}", flush=True)
+    stream_test.resources("start")
+    for country in countries:
+        stream_test.stream_country(
+            country, "test_source1", "test_source2", "test_source3", STREAM_DIR, models, suffix_sets, translit_map,
+            batch_size=batch, test_cap=_args.test_cap, n_workers=_args.feature_workers,
+        )
+    _reset_duckdb()
+
+
+def stage_merge() -> None:
+    """Decision layer over the small prediction files, then matching_results.tsv + candidate_pairs.tsv + validator."""
+    from src import stream_test
+
+    dirs = [d.strip() for d in _args.merge_dirs.split(",") if d.strip()] if _args.merge_dirs else [str(STREAM_DIR)]
+    threshold = _args.threshold if _args.threshold is not None else stream_test.default_threshold()
+    print(f"[merge] threshold={threshold} (None = expected-F0.5 policy), reading {dirs}", flush=True)
+    _reset_duckdb()
+    con = io_utils.get_connection()
+    io_utils.register_source_view(con, "test_source1", config.TEST_SOURCE1)
+    s1_country = dict(con.execute("SELECT entity_id, country FROM test_source1").fetchall())
+    con.close()
+    res = stream_test.merge_predictions(dirs, set(s1_country), s1_country, config.OUTPUT_DIR, threshold)
+    if res["validator_exit"] != 0:
+        print("[merge] WARNING: validator reported blocking issues -- fix before submitting.", flush=True)
+    code = res["validator_exit"]
+    report = json.loads(TRAIN_REPORT_PATH.read_text(encoding="utf-8")) if TRAIN_REPORT_PATH.exists() else None
+    dest = write_outputs.save_versioned_copy(config.OUTPUT_DIR / "matching_results.tsv", config.OUTPUT_DIR / "candidate_pairs.tsv", report)
+    print(f"[merge] versioned copy saved to {dest}", flush=True)
+
+
 def stage_write() -> None:
     pred_df = pd.read_parquet(PREDICTIONS_PATH)
     preds = {
@@ -740,6 +804,8 @@ STAGES = {
     "test_features": stage_test_features,
     "predict": stage_predict,
     "write": stage_write,
+    "test_stream": stage_test_stream,
+    "merge": stage_merge,
 }
 STAGE_ORDER = [
     "normalize", "val_slice", "val_blocking", "val_features", "val_train",
@@ -788,8 +854,8 @@ def _run_stage_with_logging(name: str, fn) -> None:
 def main() -> None:
     stages_to_run = STAGE_ORDER if _args.stage == "all" else [_args.stage]
     if _args.stage == "all" and _args.skip_full_train:
-        stages_to_run = [s for s in stages_to_run if s not in ("train_features", "train")]
-        print("[main] --skip-full-train: skipping train_features/train, predicting test with the val_train model", flush=True)
+        stages_to_run = [s for s in stages_to_run if s not in ("train_features", "train", "test_features", "predict", "write")] + ["test_stream", "merge"]
+        print("[main] --skip-full-train: skipping train_features/train; test set is streamed (test_stream -> merge) with the val_train model", flush=True)
     for name in stages_to_run:
         _run_stage_with_logging(name, STAGES[name])
 

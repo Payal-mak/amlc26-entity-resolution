@@ -87,6 +87,31 @@ def write_candidate_pairs_from_parquet(parquet_glob: str, required_ids, out_path
     return len(joined)
 
 
+def write_candidate_lists_from_parquet(parquet_files: list, required_ids, out_path: Path, memory_limit: str = "4GB") -> int:
+    """candidate_pairs.tsv from parquet files that ALREADY hold one row per S1
+    (columns s1_id, cands = sorted comma-joined candidate ids), the format the streaming
+    test path writes per batch. Only those strings are kept in memory (~1GB for 1.7M S1).
+    Every id in required_ids gets a row (empty if it has no candidates).
+    Output: number of S1 rows with at least one candidate.
+    """
+    import duckdb
+
+    listed = ", ".join("'" + Path(f).as_posix().replace("'", "''") + "'" for f in parquet_files)
+    con = duckdb.connect()
+    con.execute(f"SET memory_limit = '{memory_limit}'")
+    con.execute(f"SET temp_directory = '{config.DUCKDB_TMP_DIR.as_posix()}'")
+    try:
+        joined = dict(con.execute(f"SELECT s1_id, cands FROM read_parquet([{listed}])").fetchall())
+    finally:
+        con.close()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for s1id in sorted(required_ids):
+            f.write(f"{s1id}\t{joined.get(s1id, '')}\n")
+    return sum(1 for v in joined.values() if v)
+
+
 def run_validator(matching_path: Path, candidate_path: Path, test_dir: Path) -> tuple:
     """Run utils/validate_submission.py against the two files just written.
 

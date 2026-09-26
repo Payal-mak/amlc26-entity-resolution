@@ -245,34 +245,47 @@ CONTEXT_FEATURE_COLUMNS = ["rank_by_s1", "gap_to_best_by_s1", "reverse_rank"]
 BASE_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c not in CONTEXT_FEATURE_COLUMNS]
 
 
-def build_pair_features_base(
-    pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame, prep: pd.DataFrame = None
-) -> pd.DataFrame:
-    """Compute every PAIRWISE (non-context) feature for one chunk of pairs.
+_LOOKUP_COLUMNS = ["name_full", "name_core", "business_address", "postal_code"]
 
-    Split out from the context features (rank_by_s1 / gap_to_best_by_s1 /
-    reverse_rank) on purpose: those need the FULL candidate pool for a given
-    s1_id/cand_id to be meaningful, so they can't be computed correctly on an
-    arbitrary row-chunk (see add_context_features). This function is safe to
-    call chunk-by-chunk to bound peak memory on large countries.
 
-    Inputs: pairs (s1_id, cand_id, blocks[comma list], n_blocks -- from
-    src.blocking's tagged/capped output), s1_df / cand_df (already carrying
-    name_full/name_core from blocking.add_normalized_columns, plus
-    business_address, entity_id, and a postal_code column).
-    `prep` is prepare_entities(s1_df, cand_df); pass it when calling chunk-by-
-    chunk so per-entity work is done once per country, not once per chunk
-    (built here if omitted).
-    Output: a new DataFrame, same row order as `pairs`, with
-    BASE_FEATURE_COLUMNS plus s1_id/cand_id for joining back.
-    """
-    s1_idx = s1_df.set_index("entity_id")
-    cand_idx = cand_df.set_index("entity_id")
+def make_lookup(s1_df: pd.DataFrame, cand_df: pd.DataFrame) -> tuple:
+    """(s1_idx, cand_idx): the four columns the pair features read, indexed by
+    entity_id. Build ONCE per country and pass to build_pair_features_parallel;
+    re-indexing a multi-million-row frame per batch is pure waste."""
+    return (s1_df.set_index("entity_id")[_LOOKUP_COLUMNS], cand_df.set_index("entity_id")[_LOOKUP_COLUMNS])
 
-    s1_rows = s1_idx.loc[pairs["s1_id"]].reset_index(drop=True)
-    cand_rows = cand_idx.loc[pairs["cand_id"]].reset_index(drop=True)
 
-    n = len(pairs)
+def _gather_inputs(pairs: pd.DataFrame, s1_idx: pd.DataFrame, cand_idx: pd.DataFrame, prep: pd.DataFrame) -> dict:
+    """Everything one chunk of pairs needs, as plain Python lists / arrays (cheap
+    to pickle to a worker process; no DataFrame, no big shared object)."""
+    s1_rows = s1_idx.loc[pairs["s1_id"].values]
+    cand_rows = cand_idx.loc[pairs["cand_id"].values]
+    p1 = prep.loc[pairs["s1_id"].values]
+    p2 = prep.loc[pairs["cand_id"].values]
+    return {
+        "nf1": s1_rows["name_full"].tolist(), "nf2": cand_rows["name_full"].tolist(),
+        "nc1": s1_rows["name_core"].tolist(), "nc2": cand_rows["name_core"].tolist(),
+        "addr1": s1_rows["business_address"].tolist(), "addr2": cand_rows["business_address"].tolist(),
+        "postal1": s1_rows["postal_code"].values, "postal2": cand_rows["postal_code"].values,
+        "n_blocks": pairs["n_blocks"].astype(np.float32).values,
+        "blocks": pairs["blocks"].fillna("").tolist(),
+        "is_s2": pairs["cand_id"].str.startswith("S2-").values,
+        "hn1": p1["hn"].tolist(), "hn2": p2["hn"].tolist(),
+        "st1": p1["street"].tolist(), "st2": p2["street"].tolist(),
+        "nfc1": p1["name_full_c"].tolist(), "nfc2": p2["name_full_c"].tolist(),
+        "ncc1": p1["name_core_c"].tolist(), "ncc2": p2["name_core_c"].tolist(),
+        "ns1": p1["name_nospace"].tolist(), "ns2": p2["name_nospace"].tolist(),
+        "ct1": p1["core_tokens"].tolist(), "ct2": p2["core_tokens"].tolist(),
+        "is1": p1["idf_sum"].values, "is2": p2["idf_sum"].values,
+    }
+
+
+def _compute_columns(inp: dict, idf: dict) -> dict:
+    """The pairwise (non-context) feature columns, as {name: numpy array}, from
+    _gather_inputs' lists. Pure function: runs identically in the parent or in a
+    worker process, so sequential and parallel builds give the same numbers."""
+    nf1, nf2, nc1, nc2 = inp["nf1"], inp["nf2"], inp["nc1"], inp["nc2"]
+    n = len(nf1)
     out = {}
 
     name_full_ratio = np.empty(n, dtype=np.float32)
@@ -288,13 +301,10 @@ def build_pair_features_base(
     digit_jac = np.empty(n, dtype=np.float32)
     len_diff = np.empty(n, dtype=np.float32)
 
-    s1_addr_clean = s1_rows["business_address"].map(normalize.basic_clean).tolist()
-    cand_addr_clean = cand_rows["business_address"].map(normalize.basic_clean).tolist()
-    s1_digits = s1_rows["business_address"].map(_digit_tokens).tolist()
-    cand_digits = cand_rows["business_address"].map(_digit_tokens).tolist()
-
-    nf1, nf2 = s1_rows["name_full"].tolist(), cand_rows["name_full"].tolist()
-    nc1, nc2 = s1_rows["name_core"].tolist(), cand_rows["name_core"].tolist()
+    s1_addr_clean = [normalize.basic_clean(x) for x in inp["addr1"]]
+    cand_addr_clean = [normalize.basic_clean(x) for x in inp["addr2"]]
+    s1_digits = [_digit_tokens(x) for x in inp["addr1"]]
+    cand_digits = [_digit_tokens(x) for x in inp["addr2"]]
 
     for i, (a, b, ca, cb, aa, ab, da, db) in enumerate(
         zip(nf1, nf2, nc1, nc2, s1_addr_clean, cand_addr_clean, s1_digits, cand_digits)
@@ -328,26 +338,19 @@ def build_pair_features_base(
     out["digit_jaccard"] = digit_jac
     out["name_full_len_diff"] = len_diff
 
-    s1_postal = s1_rows["postal_code"].values
-    cand_postal = cand_rows["postal_code"].values
+    s1_postal, cand_postal = inp["postal1"], inp["postal2"]
     both_present = pd.notna(s1_postal) & pd.notna(cand_postal)
     out["postal_equal"] = (both_present & (s1_postal == cand_postal)).astype(np.float32)
     out["postal_conflict"] = (both_present & (s1_postal != cand_postal)).astype(np.float32)
     out["postal_missing"] = (~both_present).astype(np.float32)
 
-    out["n_blocks"] = pairs["n_blocks"].astype(np.float32).values
-    blocks_str = pairs["blocks"].fillna("")
+    out["n_blocks"] = inp["n_blocks"]
+    blocks_str = pd.Series(inp["blocks"], dtype=object)
     for b in BLOCK_NAMES:
         out[f"block_{b}"] = blocks_str.str.contains(b, regex=False).astype(np.float32).values
+    out["source_is_s2"] = np.asarray(inp["is_s2"]).astype(np.float32)
 
-    out["source_is_s2"] = pairs["cand_id"].str.startswith("S2-").astype(np.float32).values
-
-    if prep is None:
-        prep = prepare_entities(s1_df, cand_df)
-    p1 = prep.loc[pairs["s1_id"].values]
-    p2 = prep.loc[pairs["cand_id"].values]
-
-    sig = [house_number_signals(a, b) for a, b in zip(p1["hn"], p2["hn"])]
+    sig = [house_number_signals(a, b) for a, b in zip(inp["hn1"], inp["hn2"])]
     rel = np.fromiter((s[0] for s in sig), dtype=np.int8, count=n)
     out["hn_small_diff"] = np.fromiter((s[1] for s in sig), dtype=np.float32, count=n)
     out["hn_min_abs_diff_log"] = np.fromiter((s[2] for s in sig), dtype=np.float32, count=n)
@@ -359,29 +362,26 @@ def build_pair_features_base(
     out["hn_conflict"] = (rel == HN_CONFLICT).astype(np.float32)
     out["hn_both_missing"] = (rel == HN_BOTH_MISSING).astype(np.float32)
 
-    st1, st2 = p1["street"].tolist(), p2["street"].tolist()
-    either_empty = np.array([(not a) or (not b) for a, b in zip(st1, st2)])
+    st1, st2 = inp["st1"], inp["st2"]
+    either_empty = np.array([(not a) or (not b) for a, b in zip(st1, st2)], dtype=bool)
     for name, scorer in (("street_ratio", fuzz.ratio), ("street_token_set_ratio", fuzz.token_set_ratio),
                          ("street_token_sort_ratio", fuzz.token_sort_ratio)):
         v = _pairwise(scorer, st1, st2)
         v[either_empty] = np.nan  # a blank/number-only address carries no street signal
         out[name] = v
 
-    nf1, nf2 = p1["name_full_c"].tolist(), p2["name_full_c"].tolist()
-    out["name_clean_full_ratio"] = _pairwise(fuzz.ratio, nf1, nf2)
-    out["name_clean_core_ratio"] = _pairwise(fuzz.ratio, p1["name_core_c"].tolist(), p2["name_core_c"].tolist())
-    ns1, ns2 = p1["name_nospace"].tolist(), p2["name_nospace"].tolist()
-    out["name_nospace_ratio"] = _pairwise(fuzz.ratio, ns1, ns2)
-    out["name_nospace_partial_ratio"] = _pairwise(fuzz.partial_ratio, ns1, ns2)
+    out["name_clean_full_ratio"] = _pairwise(fuzz.ratio, inp["nfc1"], inp["nfc2"])
+    out["name_clean_core_ratio"] = _pairwise(fuzz.ratio, inp["ncc1"], inp["ncc2"])
+    out["name_nospace_ratio"] = _pairwise(fuzz.ratio, inp["ns1"], inp["ns2"])
+    out["name_nospace_partial_ratio"] = _pairwise(fuzz.partial_ratio, inp["ns1"], inp["ns2"])
     out["name_core_containment"] = np.fromiter(
-        (_containment(a, b) for a, b in zip(p1["core_tokens"], p2["core_tokens"])), dtype=np.float32, count=n
+        (_containment(a, b) for a, b in zip(inp["ct1"], inp["ct2"])), dtype=np.float32, count=n
     )
 
-    idf = prep.attrs["idf"]
     jac = np.zeros(n, dtype=np.float32)
     cont = np.zeros(n, dtype=np.float32)
     max_shared = np.zeros(n, dtype=np.float32)
-    for i, (ta, tb, sa, sb) in enumerate(zip(p1["core_tokens"], p2["core_tokens"], p1["idf_sum"], p2["idf_sum"])):
+    for i, (ta, tb, sa, sb) in enumerate(zip(inp["ct1"], inp["ct2"], inp["is1"], inp["is2"])):
         shared = ta & tb
         if not shared:
             continue
@@ -405,11 +405,115 @@ def build_pair_features_base(
     )
     low_name = (jac < LOW_NAME_IDF_MAX) & (out["name_nospace_ratio"] < LOW_NAME_NOSPACE_MAX)
     out["same_addr_low_name"] = (same_addr & low_name).astype(np.float32)
+    return out
 
-    result = pd.DataFrame(out)
+
+def build_pair_features_base(
+    pairs: pd.DataFrame, s1_df: pd.DataFrame, cand_df: pd.DataFrame, prep: pd.DataFrame = None
+) -> pd.DataFrame:
+    """Compute every PAIRWISE (non-context) feature for one chunk of pairs.
+
+    Split out from the context features (rank_by_s1 / gap_to_best_by_s1 /
+    reverse_rank) on purpose: those need the FULL candidate pool for a given
+    s1_id/cand_id to be meaningful, so they can't be computed correctly on an
+    arbitrary row-chunk (see add_context_features). This function is safe to
+    call chunk-by-chunk to bound peak memory on large countries.
+
+    Inputs: pairs (s1_id, cand_id, blocks[comma list], n_blocks -- from
+    src.blocking's tagged/capped output), s1_df / cand_df (already carrying
+    name_full/name_core from blocking.add_normalized_columns, plus
+    business_address, entity_id, and a postal_code column).
+    `prep` is prepare_entities(s1_df, cand_df); pass it when calling chunk-by-
+    chunk so per-entity work is done once per country, not once per chunk
+    (built here if omitted).
+    Output: a new DataFrame, same row order as `pairs`, with
+    BASE_FEATURE_COLUMNS plus s1_id/cand_id for joining back.
+    """
+    if prep is None:
+        prep = prepare_entities(s1_df, cand_df)
+    s1_idx, cand_idx = make_lookup(s1_df, cand_df)
+    return _assemble(pairs, _compute_columns(_gather_inputs(pairs, s1_idx, cand_idx, prep), prep.attrs["idf"]))
+
+
+def _assemble(pairs: pd.DataFrame, cols: dict) -> pd.DataFrame:
+    result = pd.DataFrame(cols)
     result["s1_id"] = pairs["s1_id"].values
     result["cand_id"] = pairs["cand_id"].values
     return result
+
+
+# ---- multi-process build (all cores) ---------------------------------------
+# The per-pair work is pure Python + rapidfuzz calls, so threads do not help
+# (GIL); processes do. The parent gathers each chunk's inputs into plain lists
+# (_gather_inputs) and workers turn them into feature columns (_compute_columns).
+# Workers never see the big per-country frames -- only the IDF dict, handed
+# over once at pool start (inherited on Linux via fork) -- so N workers do not
+# multiply the frames' memory.
+_WORKER_IDF = None
+
+
+def _init_worker(idf: dict) -> None:
+    global _WORKER_IDF
+    _WORKER_IDF = idf
+
+
+def _worker_compute(inp: dict) -> dict:
+    return _compute_columns(inp, _WORKER_IDF)
+
+
+class FeatureWorkers:
+    """A process pool for build_pair_features_parallel. Create once per country
+    (after prepare_entities), close() when the country is done. n_workers <= 1
+    computes in the calling process (no pool)."""
+
+    def __init__(self, idf: dict, n_workers: int = None):
+        import multiprocessing as mp
+        import os
+
+        self.n = max(1, n_workers or os.cpu_count() or 1)
+        self.idf = idf
+        self.pool = None
+        if self.n > 1:
+            from concurrent.futures import ProcessPoolExecutor
+
+            ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
+            self.pool = ProcessPoolExecutor(self.n, mp_context=ctx, initializer=_init_worker, initargs=(idf,))
+
+    def close(self) -> None:
+        if self.pool is not None:
+            self.pool.shutdown()
+            self.pool = None
+
+
+def build_pair_features_parallel(
+    pairs: pd.DataFrame, lookup: tuple, prep: pd.DataFrame, workers: FeatureWorkers, chunk_rows: int = 100_000
+) -> pd.DataFrame:
+    """Same output as build_pair_features_base, but the pairs are cut into
+    chunk_rows-row pieces computed on workers.n processes. At most 2 x n chunks
+    are in flight, so memory stays bounded whatever the number of pairs.
+
+    Inputs: pairs for one S1 batch, lookup = make_lookup(...), prep, workers.
+    """
+    from collections import deque
+
+    s1_idx, cand_idx = lookup
+    pieces = [pairs.iloc[a:a + chunk_rows] for a in range(0, len(pairs), chunk_rows)]
+    results = []
+    if workers.pool is None:
+        for piece in pieces:
+            results.append(_compute_columns(_gather_inputs(piece, s1_idx, cand_idx, prep), workers.idf))
+    else:
+        inflight = deque()
+        for piece in pieces:
+            inflight.append(workers.pool.submit(_worker_compute, _gather_inputs(piece, s1_idx, cand_idx, prep)))
+            while len(inflight) >= 2 * workers.n:
+                results.append(inflight.popleft().result())
+        while inflight:
+            results.append(inflight.popleft().result())
+    if not results:
+        return pd.DataFrame(columns=BASE_FEATURE_COLUMNS + ["s1_id", "cand_id"])
+    cols = {k: np.concatenate([r[k] for r in results]) for k in results[0]}
+    return _assemble(pairs, cols)
 
 
 def add_context_features(df: pd.DataFrame) -> pd.DataFrame:
