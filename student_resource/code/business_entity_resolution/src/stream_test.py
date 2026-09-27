@@ -58,6 +58,17 @@ def resources(tag: str, extra_paths=()) -> None:
             continue
         seen.add(key)
         parts.append(f"{p}: {du.free / 1e9:.1f}GB free of {du.total / 1e9:.0f}GB")
+    for cg in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.peak"):
+        try:
+            v = Path(cg).read_text().strip()
+            parts.append(f"{Path(cg).name}={int(v) / 1e9:.1f}GB" if v.isdigit() else f"{Path(cg).name}={v}")
+        except OSError:
+            pass
+    try:
+        du = shutil.disk_usage("/dev/shm")
+        parts.append(f"/dev/shm: {du.free / 1e9:.1f}GB free of {du.total / 1e9:.1f}GB")
+    except OSError:
+        pass
     try:
         import psutil
 
@@ -119,6 +130,11 @@ def stream_country(
     for d in (pred_dir, cand_dir, work):
         d.mkdir(parents=True, exist_ok=True)
     t_country = time.time()
+
+    # Worker processes are forked NOW, while this process is still small (a few hundred MB), not after the
+    # per-country tables exist; they get the IDF table later through set_idf. See features.FeatureWorkers.
+    workers = features.FeatureWorkers(None, n_workers)
+    resources(f"{country} workers started")
 
     _clean_duckdb_tmp()
     con = io_utils.get_connection()
@@ -209,7 +225,7 @@ def stream_country(
     gc.collect()
     print(f"  country={country}: per-entity prep {time.time() - t0:.0f}s", flush=True)
     resources(f"{country} after prep")
-    workers = features.FeatureWorkers(prep.attrs["idf"], n_workers)
+    workers.set_idf(prep.attrs["idf"], work)
     try:
         for b in todo:
             tb = time.time()

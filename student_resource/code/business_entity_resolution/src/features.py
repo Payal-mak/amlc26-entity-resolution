@@ -19,6 +19,7 @@ without a vectorization trick.
 
 import gc
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -450,6 +451,7 @@ def _assemble(pairs: pd.DataFrame, cols: dict) -> pd.DataFrame:
 # over once at pool start (inherited on Linux via fork) -- so N workers do not
 # multiply the frames' memory.
 _WORKER_IDF = None
+_WORKER_IDF_PATH = None
 
 
 def _init_worker(idf: dict) -> None:
@@ -457,32 +459,81 @@ def _init_worker(idf: dict) -> None:
     _WORKER_IDF = idf
 
 
-def _worker_compute(inp: dict) -> dict:
+def _ping(_i: int) -> int:
+    """Occupies a worker for a moment so the pool really starts ALL its processes now."""
+    import time
+
+    time.sleep(0.3)
+    return _i
+
+
+def _worker_compute(inp: dict, idf_path: str = None) -> dict:
+    """Feature columns for one chunk. The IDF table is either inherited at fork
+    (FeatureWorkers(idf, n)) or loaded ONCE per worker from idf_path
+    (FeatureWorkers(None, n) + set_idf), see FeatureWorkers."""
+    global _WORKER_IDF, _WORKER_IDF_PATH
+    if idf_path is not None and idf_path != _WORKER_IDF_PATH:
+        import pickle
+
+        with open(idf_path, "rb") as f:
+            _WORKER_IDF = pickle.load(f)
+        _WORKER_IDF_PATH = idf_path
     return _compute_columns(inp, _WORKER_IDF)
 
 
 class FeatureWorkers:
-    """A process pool for build_pair_features_parallel. Create once per country
-    (after prepare_entities), close() when the country is done. n_workers <= 1
-    computes in the calling process (no pool)."""
+    """A process pool for build_pair_features_parallel. n_workers <= 1 computes in
+    the calling process (no pool). close() when done.
 
-    def __init__(self, idf: dict, n_workers: int = None):
+    Two ways to hand over the IDF table (a dict of every name token of the country):
+      FeatureWorkers(idf, n)   inherited at fork -- fine for small countries;
+      FeatureWorkers(None, n)  create the pool FIRST, while the process is still
+                               small, then set_idf(idf) once prepare_entities has run.
+    The second is what the streaming test path uses: forking after the per-country
+    tables exist (9-13GB for India/US) left every worker a copy-on-write view of
+    them, which is where the memory pressure (and the 3x slower features on India)
+    came from. set_idf pickles the table to a file and each worker loads it once."""
+
+    def __init__(self, idf: dict = None, n_workers: int = None):
         import multiprocessing as mp
         import os
 
         self.n = max(1, n_workers or os.cpu_count() or 1)
         self.idf = idf
+        self.idf_path = None
         self.pool = None
         if self.n > 1:
             from concurrent.futures import ProcessPoolExecutor
 
             ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
-            self.pool = ProcessPoolExecutor(self.n, mp_context=ctx, initializer=_init_worker, initargs=(idf,))
+            if idf is None:
+                self.pool = ProcessPoolExecutor(self.n, mp_context=ctx)
+                list(self.pool.map(_ping, range(self.n)))        # start every worker now, while this process is small
+            else:
+                self.pool = ProcessPoolExecutor(self.n, mp_context=ctx, initializer=_init_worker, initargs=(idf,))
+
+    def set_idf(self, idf: dict, directory=None) -> None:
+        """Give the workers the IDF table (call after prepare_entities)."""
+        import pickle
+        import tempfile
+
+        self.idf = idf
+        if self.pool is not None:
+            fd, path = tempfile.mkstemp(prefix="idf_", suffix=".pkl", dir=str(directory) if directory else None)
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(idf, f, protocol=pickle.HIGHEST_PROTOCOL)
+            self.idf_path = path
 
     def close(self) -> None:
         if self.pool is not None:
             self.pool.shutdown()
             self.pool = None
+        if self.idf_path:
+            try:
+                os.remove(self.idf_path)
+            except OSError:
+                pass
+            self.idf_path = None
 
 
 def build_pair_features_parallel(
@@ -505,7 +556,7 @@ def build_pair_features_parallel(
     else:
         inflight = deque()
         for piece in pieces:
-            inflight.append(workers.pool.submit(_worker_compute, _gather_inputs(piece, s1_idx, cand_idx, prep)))
+            inflight.append(workers.pool.submit(_worker_compute, _gather_inputs(piece, s1_idx, cand_idx, prep), workers.idf_path))
             while len(inflight) >= 2 * workers.n:
                 results.append(inflight.popleft().result())
         while inflight:

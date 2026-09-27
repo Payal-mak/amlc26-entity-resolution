@@ -80,3 +80,26 @@ class TestParallelFeaturesMatchSequential(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEarlyWorkers(unittest.TestCase):
+    def test_pool_started_before_idf_gives_the_same_features(self):
+        def rec(i, name, addr):
+            return {"entity_id": i, "business_name": name, "business_address": addr, "country": "US",
+                    "name_full": name.lower(), "name_core": name.lower(), "postal_code": None}
+        s1 = pd.DataFrame([rec("S1-1", "Quality Biomedical Corp", "7800 Valburn Drive, Austin, TX"), rec("S1-2", "Acme Zorbo", "9 Elm Street, Austin, TX")])
+        cand = pd.DataFrame([rec("S2-1", "QUALITY BIOMEDICAL", "AUSTIN, TX, 7802 VALBURN DR"), rec("S2-2", "Acme Zorbo Inc", "9 Elm St, Austin, TX")])
+        pairs = pd.DataFrame({"s1_id": ["S1-1", "S1-2", "S1-1", "S1-2"] * 3, "cand_id": ["S2-1", "S2-2", "S2-2", "S2-1"] * 3,
+                              "blocks": ["b1_exact_core"] * 12, "n_blocks": [1] * 12})
+        w = features.FeatureWorkers(None, 2)          # forked BEFORE the tables / idf exist
+        try:
+            prep = features.prepare_entities(s1, cand)
+            lookup = features.make_lookup(s1, cand)
+            w.set_idf(prep.attrs["idf"])
+            par = features.build_pair_features_parallel(pairs, lookup, prep, w, chunk_rows=5)
+        finally:
+            w.close()
+        seq = features.build_pair_features_base(pairs, s1, cand, prep)
+        for c in features.BASE_FEATURE_COLUMNS:
+            np.testing.assert_allclose(par[c].to_numpy(dtype=float), seq[c].to_numpy(dtype=float), equal_nan=True, err_msg=c)
+        self.assertIsNone(w.idf_path)                  # the pickle file was removed by close()
