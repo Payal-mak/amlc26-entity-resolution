@@ -90,8 +90,18 @@ def _clean_duckdb_tmp() -> None:
 
 
 # ------------------------------------------------------------------ helpers
-def load_country_frame(con, view: str, country: str, suffix_sets: dict, translit_map: dict) -> pd.DataFrame:
-    df = con.execute(f"SELECT * FROM {view} WHERE country = ?", [country]).fetchdf()
+def load_country_frame(
+    con, view: str, country: str, suffix_sets: dict, translit_map: dict, id_filter: set = None
+) -> pd.DataFrame:
+    """id_filter (optional): restrict to these entity_ids (used by scripts/scale_realistic_val.py
+    to sample a subset of S1 while keeping the full candidate pool; None = every row of `view`,
+    country-filtered, exactly as before)."""
+    if id_filter:
+        placeholders = ",".join("?" * len(id_filter))
+        df = con.execute(f"SELECT * FROM {view} WHERE country = ? AND entity_id IN ({placeholders})",
+                         [country, *id_filter]).fetchdf()
+    else:
+        df = con.execute(f"SELECT * FROM {view} WHERE country = ?", [country]).fetchdf()
     return blocking.add_normalized_columns(df, suffix_sets, translit_map)
 
 
@@ -120,9 +130,16 @@ def _candidate_lists(pairs: pd.DataFrame) -> pd.DataFrame:
 def stream_country(
     country: str, s1_view: str, s2_view: str, s3_view: str, out_dir: Path, models, suffix_sets: dict,
     translit_map: dict, batch_size: int = DEFAULT_BATCH_S1, test_cap: int = None, n_workers: int = None,
+    s1_id_filter: set = None,
 ) -> dict:
     """Run passes 1-3 for one country. Writes out_dir/pred/pred_{country}_{b}.parquet and
-    out_dir/cands/cands_{country}_{b}.parquet (both small); returns counts for logging."""
+    out_dir/cands/cands_{country}_{b}.parquet (both small); returns counts for logging.
+
+    s1_id_filter (optional): restrict S1 to this id set while the S2/S3 candidate pool (s2_view/
+    s3_view) stays FULL -- this is exactly what scripts/scale_realistic_val.py needs: a small,
+    labeled S1 sample scored against the true full-size candidate pool, through the identical
+    blocking/rank/feature/predict code path the real test run uses. None (default) = every S1 of
+    the country, i.e. the normal test path, unchanged."""
     if isinstance(models, dict):
         raise NotImplementedError("streaming inference supports the fold-model ensemble only, not --two-stage")
     pred_dir, cand_dir = out_dir / "pred", out_dir / "cands"
@@ -139,7 +156,7 @@ def stream_country(
     _clean_duckdb_tmp()
     con = io_utils.get_connection()
     io_utils.register_all_standard_views(con)
-    s1_c = load_country_frame(con, s1_view, country, suffix_sets, translit_map)
+    s1_c = load_country_frame(con, s1_view, country, suffix_sets, translit_map, s1_id_filter)
     s2_c = load_country_frame(con, s2_view, country, suffix_sets, translit_map)
     s3_c = load_country_frame(con, s3_view, country, suffix_sets, translit_map)
     con.close()
